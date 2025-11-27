@@ -2,26 +2,23 @@ package net.floodlightcontroller.packetinmanager;
 
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.Collections;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.projectfloodlight.openflow.protocol.OFMessage;
 import org.projectfloodlight.openflow.protocol.OFPacketIn;
-import org.projectfloodlight.openflow.protocol.OFFactory;
-import org.projectfloodlight.openflow.protocol.OFFlowAdd;
+import org.projectfloodlight.openflow.protocol.OFPacketOut;
 import org.projectfloodlight.openflow.protocol.OFType;
 import org.projectfloodlight.openflow.protocol.action.OFAction;
-import org.projectfloodlight.openflow.protocol.instruction.OFInstruction;
-
 import org.projectfloodlight.openflow.protocol.match.MatchField;
-import org.projectfloodlight.openflow.types.DatapathId;
 import org.projectfloodlight.openflow.types.EthType;
 import org.projectfloodlight.openflow.types.OFPort;
 import org.projectfloodlight.openflow.types.IpProtocol;
 import org.projectfloodlight.openflow.types.TransportPort;
 import org.projectfloodlight.openflow.types.IPv4Address;
-import org.projectfloodlight.openflow.types.U64;
 
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
@@ -39,26 +36,25 @@ import net.floodlightcontroller.packet.UDP;
 import net.floodlightcontroller.packet.DHCP;
 import net.floodlightcontroller.packet.DHCPOption;
 
-import net.floodlightcontroller.devicemanager.IDeviceService;
-import net.floodlightcontroller.devicemanager.IDevice;
-import net.floodlightcontroller.devicemanager.SwitchPort;
-
-import net.floodlightcontroller.routing.IRoutingService;
-import net.floodlightcontroller.routing.Route;
-
-import net.floodlightcontroller.util.NodePortTuple;
-
 public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
     protected IFloodlightProviderService floodlightProvider;
-    protected IDeviceService deviceService;
-    protected IRoutingService routingService;
 
-    // Valor estándar de la opción 53 para DHCPDISCOVER
+    // DHCP Message Types (RFC 2131)
     private static final byte DHCPDISCOVER = 1;
+    private static final byte DHCPOFFER    = 2;
+    private static final byte DHCPREQUEST  = 3;
+    private static final byte DHCPACK      = 5;
 
-    // IP del servidor DHCP en tu topología (AJÚSTALA A TU CASO)
-    private static final IPv4Address DHCP_SERVER_IP = IPv4Address.of("10.0.0.254");
+    // Solo para referencia / logs (no se usa para el forwarding)
+    private static final String DHCP_SERVER_IP = "10.0.0.6";
+
+    // IP del portal cautivo
+    private static final IPv4Address PORTAL_IP = IPv4Address.of("10.0.0.7");
+
+    // Conjunto de IPs de clientes que ya recibieron DHCPACK (autorizados a ir al portal)
+    private final Set<IPv4Address> allowedClients =
+            Collections.newSetFromMap(new ConcurrentHashMap<IPv4Address, Boolean>());
 
     @Override
     public String getName() {
@@ -87,11 +83,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         Ethernet eth = IFloodlightProviderService.bcStore.get(
                 cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
 
-        if (eth == null) {
-            System.out.println("⚠ No se pudo obtener el payload Ethernet del contexto");
-            return Command.CONTINUE;
-        }
-
         EthType etherType = eth.getEtherType();
 
         // No tocar LLDP
@@ -117,18 +108,30 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         if (etherType == EthType.ARP) {
             ARP arp = (ARP) eth.getPayload();
             System.out.println("--- ARP INFO ---");
-            System.out.println("ARP Sender IP : " + IPv4Address.of(arp.getSenderProtocolAddress()));
-            System.out.println("ARP Target IP : " + IPv4Address.of(arp.getTargetProtocolAddress()));
+            System.out.println("ARP Sender IP : " + arp.getSenderProtocolAddress());
+            System.out.println("ARP Target IP : " + arp.getTargetProtocolAddress());
+
+            // Importante: permitir que ARP circule (DHCP, gateway, portal, etc.)
+            floodArpPacket(sw, pi, inPort);
+
+            System.out.println("====================================\n");
+            return Command.STOP;
         }
 
         // --- IPv4 ---
         if (etherType == EthType.IPv4) {
             IPv4 ipv4 = (IPv4) eth.getPayload();
+            IPv4Address srcIp = ipv4.getSourceAddress();
+            IPv4Address dstIp = ipv4.getDestinationAddress();
+
             System.out.println("--- IPv4 INFO ---");
-            System.out.println("SRC IP        : " + ipv4.getSourceAddress());
-            System.out.println("DST IP        : " + ipv4.getDestinationAddress());
+            System.out.println("SRC IP        : " + srcIp);
+            System.out.println("DST IP        : " + dstIp);
             System.out.println("L4 Protocol   : " + ipv4.getProtocol());
 
+            // =========================
+            // 1) Gestión de DHCP (UDP)
+            // =========================
             if (ipv4.getProtocol() == IpProtocol.UDP) {
                 UDP udp = (UDP) ipv4.getPayload();
 
@@ -143,8 +146,13 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                         srcPort.equals(UDP.DHCP_CLIENT_PORT) &&
                         dstPort.equals(UDP.DHCP_SERVER_PORT);
 
-                if (isDhcpClientToServer) {
-                    System.out.println("Posible DHCP cliente→servidor (68→67)");
+                // Servidor → Cliente DHCP (67 -> 68)
+                boolean isDhcpServerToClient =
+                        srcPort.equals(UDP.DHCP_SERVER_PORT) &&
+                        dstPort.equals(UDP.DHCP_CLIENT_PORT);
+
+                if (isDhcpClientToServer || isDhcpServerToClient) {
+                    System.out.println("Posible tráfico DHCP detectado");
 
                     if (udp.getPayload() instanceof DHCP) {
                         DHCP dhcp = (DHCP) udp.getPayload();
@@ -165,146 +173,143 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                             System.out.println("    From MAC : " + eth.getSourceMACAddress());
                             System.out.println("    On switch: " + sw.getId() +
                                                "  IN_PORT: " + inPort);
+                        } else if (msgTypeVal == DHCPACK) {
+                            // Aquí el servidor está confirmando la IP al cliente
+                            IPv4Address clientIp = dhcp.getYourIPAddress();
+                            System.out.println(">>> DHCP ACK DETECTADO <<<");
+                            System.out.println("    IP asignada al cliente: " + clientIp);
 
-                            // 🔥 Aquí llamamos a la lógica que conecta h1 con el servidor DHCP
-                            instalarCaminoDhcp(sw.getId(), inPort);
+                            if (clientIp != null &&
+                                !clientIp.equals(IPv4Address.NONE)) {
+                                allowedClients.add(clientIp);
+                                System.out.println("    Cliente AUTORIZADO para portal: " +
+                                                   clientIp + " → " + PORTAL_IP);
+                            }
                         }
+
+                        // En cualquier mensaje DHCP (DISCOVER, OFFER, REQUEST, ACK, etc.)
+                        // reenviamos la trama usando OFPP_FLOOD para que llegue a todos los switches.
+                        floodDhcpPacket(sw, pi, inPort, isDhcpClientToServer, isDhcpServerToClient);
+
+                        System.out.println("====================================\n");
+                        return Command.STOP;
+
                     } else {
                         System.out.println("UDP payload NO es instancia de DHCP: "
                                 + udp.getPayload().getClass().getName());
                     }
                 }
             }
+
+            // ===========================================
+            // 2) Tráfico permitido: cliente ↔ portal
+            // ===========================================
+            // (a) Cliente autorizado → Portal
+            if (allowedClients.contains(srcIp) && dstIp.equals(PORTAL_IP)) {
+                System.out.println(">>> Tráfico permitido CLIENTE (" + srcIp +
+                                   ") → PORTAL (" + PORTAL_IP + ") <<<");
+                forwardPortalTraffic(sw, pi, inPort, true);
+                System.out.println("====================================\n");
+                return Command.STOP;
+            }
+
+            // (b) Portal → Cliente autorizado
+            if (srcIp.equals(PORTAL_IP) && allowedClients.contains(dstIp)) {
+                System.out.println(">>> Tráfico permitido PORTAL (" + PORTAL_IP +
+                                   ") → CLIENTE (" + dstIp + ") <<<");
+                forwardPortalTraffic(sw, pi, inPort, false);
+                System.out.println("====================================\n");
+                return Command.STOP;
+            }
+
+            // Cualquier otro tráfico IPv4 que no sea DHCP ni portal queda bloqueado
         }
 
         System.out.println("====================================\n");
 
+        // No hacemos nada especial → el paquete se descarta (sin Forwarding module)
         return Command.CONTINUE;
     }
 
     /**
-     * Usa la API interna de Floodlight para:
-     * 1) Encontrar al servidor DHCP (IDeviceService, por IP).
-     * 2) Obtener la ruta host→DHCP (IRoutingService).
-     * 3) Programar flows de DHCP (68→67 y 67→68) a lo largo de la ruta.
+     * Reenvía el paquete DHCP a todos los puertos del switch usando OFPP_FLOOD.
+     * Como todos los switches tienen regla table-miss hacia el controlador,
+     * esto hace que el paquete vaya saltando switch por switch hasta llegar
+     * al servidor DHCP y luego de vuelta al cliente.
      */
-    private void instalarCaminoDhcp(DatapathId hostSwId, OFPort hostPort) {
+    private void floodDhcpPacket(IOFSwitch sw,
+                                 OFPacketIn pi,
+                                 OFPort inPort,
+                                 boolean isClientToServer,
+                                 boolean isServerToClient) {
 
-        // 1) Buscar el dispositivo que tenga la IP del servidor DHCP
-        IDevice dhcpDevice = null;
-        for (IDevice dev : deviceService.getAllDevices()) {
-            IPv4Address[] ips = dev.getIPv4Addresses();
-            if (ips == null) continue;
-            for (IPv4Address ip : ips) {
-                if (ip.equals(DHCP_SERVER_IP)) {
-                    dhcpDevice = dev;
-                    break;
-                }
-            }
-            if (dhcpDevice != null) break;
+        System.out.println(">>> Enviando PacketOut (OFPP_FLOOD) para tráfico DHCP <<<");
+        if (isClientToServer) {
+            System.out.println("    Dirección: CLIENTE → SERVIDOR (68→67)");
+        } else if (isServerToClient) {
+            System.out.println("    Dirección: SERVIDOR → CLIENTE (67→68)");
         }
 
-        if (dhcpDevice == null) {
-            System.out.println("⚠ No se encontró el servidor DHCP en IDeviceService para IP " +
-                               DHCP_SERVER_IP);
-            return;
-        }
+        OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
 
-        // 2) Tomar el primer attachment point del servidor DHCP
-        SwitchPort[] apDhcp = dhcpDevice.getAttachmentPoints();
-        if (apDhcp == null || apDhcp.length == 0) {
-            System.out.println("⚠ Servidor DHCP sin attachment point registrado");
-            return;
-        }
+        pob.setBufferId(pi.getBufferId());
+        pob.setInPort(inPort);
 
-        DatapathId dhcpSwId = apDhcp[0].getSwitchDPID();
-        OFPort     dhcpPort = apDhcp[0].getPort();
+        List<OFAction> actions = new ArrayList<OFAction>();
+        actions.add(sw.getOFFactory().actions().output(OFPort.FLOOD, 0xFFFF));
+        pob.setActions(actions);
 
-        System.out.println("DHCP server visto en switch " + dhcpSwId + " puerto " + dhcpPort);
+        pob.setData(pi.getData());
 
-        // 3) Obtener la ruta host → servidor DHCP
-        Route route = routingService.getRoute(
-                hostSwId, hostPort,
-                dhcpSwId, dhcpPort,
-                U64.ZERO);
+        sw.write(pob.build());
+    }
 
-        if (route == null || route.getPath() == null || route.getPath().isEmpty()) {
-            System.out.println("⚠ No se pudo calcular ruta entre host (" + hostSwId + ":" + hostPort +
-                               ") y DHCP (" + dhcpSwId + ":" + dhcpPort + ")");
-            return;
-        }
+    /**
+     * FLOOD para paquetes ARP (necesario para que DHCP, gateway, portal, etc. funcionen).
+     */
+    private void floodArpPacket(IOFSwitch sw,
+                                OFPacketIn pi,
+                                OFPort inPort) {
 
-        List<NodePortTuple> path = route.getPath();
-        System.out.println("Ruta DHCP calculada: " + path.toString());
+        System.out.println(">>> Enviando PacketOut (OFPP_FLOOD) para ARP <<<");
 
-        // 4) Recorrer la ruta y programar flows de DHCP
-        //    path = [ (sw1, in1), (sw1, out1), (sw2, in2), (sw2, out2), ... ]
-        for (int i = 0; i < path.size(); i += 2) {
+        OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
+        pob.setBufferId(pi.getBufferId());
+        pob.setInPort(inPort);
 
-            DatapathId swId   = path.get(i).getNodeId();
-            OFPort     inP    = path.get(i).getPortId();
-            OFPort     outP   = path.get(i+1).getPortId();
+        List<OFAction> actions = new ArrayList<OFAction>();
+        actions.add(sw.getOFFactory().actions().output(OFPort.FLOOD, 0xFFFF));
+        pob.setActions(actions);
 
-            IOFSwitch s = floodlightProvider.getSwitch(swId);
-            if (s == null) {
-                System.out.println("⚠ Switch " + swId + " no disponible al programar flows DHCP");
-                continue;
-            }
+        pob.setData(pi.getData());
 
-            OFFactory of = s.getOFFactory();
+        sw.write(pob.build());
+    }
 
-            // ----- Flow cliente → servidor (UDP 68 -> 67) -----
-            org.projectfloodlight.openflow.protocol.match.Match matchC2S =
-                    of.buildMatch()
-                      .setExact(MatchField.ETH_TYPE, EthType.IPv4)
-                      .setExact(MatchField.IP_PROTO, IpProtocol.UDP)
-                      .setExact(MatchField.UDP_SRC, UDP.DHCP_CLIENT_PORT) // 68
-                      .setExact(MatchField.UDP_DST, UDP.DHCP_SERVER_PORT) // 67
-                      .setExact(MatchField.IN_PORT, inP)
-                      .build();
+    /**
+     * Reenvía tráfico entre clientes autorizados y el portal cautivo.
+     * Usamos también FLOOD para no depender de servicios de routing/topología.
+     */
+    private void forwardPortalTraffic(IOFSwitch sw,
+                                      OFPacketIn pi,
+                                      OFPort inPort,
+                                      boolean clientToPortal) {
 
-            List<OFAction> actionsC2S = new ArrayList<>();
-            actionsC2S.add(of.actions().output(outP, Integer.MAX_VALUE));
+        System.out.println(">>> Enviando PacketOut (OFPP_FLOOD) para tráfico CLIENTE↔PORTAL <<<");
+        System.out.println("    Sentido: " + (clientToPortal ? "CLIENTE → PORTAL" : "PORTAL → CLIENTE"));
 
-            List<OFInstruction> instC2S = Collections.singletonList(
-                    of.instructions().applyActions(actionsC2S));
+        OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
 
-            OFFlowAdd flowC2S = of.buildFlowAdd()
-                    .setPriority(100)
-                    .setMatch(matchC2S)
-                    .setInstructions(instC2S)
-                    .build();
+        pob.setBufferId(pi.getBufferId());
+        pob.setInPort(inPort);
 
-            s.write(flowC2S);
+        List<OFAction> actions = new ArrayList<OFAction>();
+        actions.add(sw.getOFFactory().actions().output(OFPort.FLOOD, 0xFFFF));
+        pob.setActions(actions);
 
-            // ----- Flow servidor → cliente (UDP 67 -> 68) -----
-            org.projectfloodlight.openflow.protocol.match.Match matchS2C =
-                    of.buildMatch()
-                      .setExact(MatchField.ETH_TYPE, EthType.IPv4)
-                      .setExact(MatchField.IP_PROTO, IpProtocol.UDP)
-                      .setExact(MatchField.UDP_SRC, UDP.DHCP_SERVER_PORT) // 67
-                      .setExact(MatchField.UDP_DST, UDP.DHCP_CLIENT_PORT) // 68
-                      // ahora el paquete entra por outP y sale por inP (camino inverso)
-                      .setExact(MatchField.IN_PORT, outP)
-                      .build();
+        pob.setData(pi.getData());
 
-            List<OFAction> actionsS2C = new ArrayList<>();
-            actionsS2C.add(of.actions().output(inP, Integer.MAX_VALUE));
-
-            List<OFInstruction> instS2C = Collections.singletonList(
-                    of.instructions().applyActions(actionsS2C));
-
-            OFFlowAdd flowS2C = of.buildFlowAdd()
-                    .setPriority(100)
-                    .setMatch(matchS2C)
-                    .setInstructions(instS2C)
-                    .build();
-
-            s.write(flowS2C);
-
-            System.out.println("✓ Flows DHCP instalados en switch " + swId +
-                               " (in=" + inP + ", out=" + outP + ")");
-        }
+        sw.write(pob.build());
     }
 
     // ===== Métodos de IFloodlightModule =====
@@ -324,8 +329,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         List<Class<? extends IFloodlightService>> deps =
                 new ArrayList<Class<? extends IFloodlightService>>();
         deps.add(IFloodlightProviderService.class);
-        deps.add(IDeviceService.class);
-        deps.add(IRoutingService.class);
         return deps;
     }
 
@@ -334,10 +337,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
             throws FloodlightModuleException {
         this.floodlightProvider =
                 context.getServiceImpl(IFloodlightProviderService.class);
-        this.deviceService =
-                context.getServiceImpl(IDeviceService.class);
-        this.routingService =
-                context.getServiceImpl(IRoutingService.class);
     }
 
     @Override
@@ -345,6 +344,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
             throws FloodlightModuleException {
 
         floodlightProvider.addOFMessageListener(OFType.PACKET_IN, this);
-        System.out.println("=== PacketInManager cargado (logueando PACKET_IN y programando camino DHCP) ===");
+        System.out.println("=== PacketInManager cargado (DHCP + ARP + portal cautivo " +
+                           PORTAL_IP + ") ===");
     }
 }
