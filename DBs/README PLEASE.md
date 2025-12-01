@@ -1,4 +1,4 @@
-**base\_datos\_final:** base de datos inicial que se utilizó para radius y para el portal, actualmente se sigue utilizando pero con las tablas por defecto que utiliza Radius, es decir, se elimina la tabla de user\_roles que se encuentra en esta versión.
+**radius**: base de datos utilizada por Radius, se encarga de la autorización del usuario, es aquí donde se almacena la contraseña, contiene el username, contraseña, además de otros campos importantes para el radius.
 
 
 
