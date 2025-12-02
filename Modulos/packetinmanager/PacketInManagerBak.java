@@ -74,12 +74,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
     // =========================================================
     //          CONFIGURACIÓN DEL PORTAL CAUTIVO (EDITAR AQUÍ)
     // =========================================================
-    //
-    // Cambia estos 3 valores según tu topología:
-    //
-    //  - PORTAL_IP: IP del servidor del portal cautivo
-    //  - PORTAL_SWITCH: DPID del switch donde está conectado el portal
-    //  - PORTAL_PORT: puerto del switch donde está conectado el portal
 
     private static final IPv4Address PORTAL_IP =
             IPv4Address.of("10.0.0.7");
@@ -92,7 +86,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
     // Parámetros de los flujos que se instalarán para host ↔ portal
     private static final int FLOW_PRIORITY      = 100;
-    private static final int FLOW_IDLE_TIMEOUT  = 300; // segundos 
+    private static final int FLOW_IDLE_TIMEOUT  = 300; // segundos
     private static final int FLOW_HARD_TIMEOUT  = 0;   // 0 = sin límite
 
     // =========================================================
@@ -274,8 +268,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                             }
                         }
 
-                        // En cualquier mensaje DHCP (DISCOVER, OFFER, REQUEST, ACK, etc.),
-                        // reenviamos la trama usando OFPP_FLOOD para que llegue a todos los switches.
+                        // En cualquier mensaje DHCP reenviamos con FLOOD
                         floodDhcpPacket(sw, pi, inPort, isDhcpClientToServer, isDhcpServerToClient);
 
                         System.out.println("====================================\n");
@@ -334,35 +327,18 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                 }
             }
 
-            // ==========================
-            // REINSTALACIÓN DE FLOWS
-            // ==========================
-
-            // Si el host ya tiene FULL_ACCESS, no aplicamos portal cautivo
-            if (session.state == HostState.FULL_ACCESS) {
-                System.out.println("Host " + srcIp + " tiene FULL_ACCESS → no se reinstalan flujos.");
+            // Si el host ya está capturado o tiene FULL_ACCESS, no volvemos a instalar flujos
+            if (session.state == HostState.CAPTURED_TO_PORTAL ||
+                session.state == HostState.FULL_ACCESS) {
+                System.out.println("Host " + srcIp + " ya tiene estado " + session.state +
+                                   " → no se reinstalan flujos.");
                 System.out.println("====================================\n");
                 return Command.CONTINUE;
             }
 
-            // Caso especial: El host está capturado pero sus flows expiraron
-            // Si vuelve a hablar con el portal, reinstalamos los flows
-            if (session.state == HostState.CAPTURED_TO_PORTAL &&
-                dstIp != null &&
-                dstIp.equals(PORTAL_IP)) {
-
-                System.out.println("Host " + srcIp + " ya tenía estado CAPTURED_TO_PORTAL → reinstalando flows.");
-                captureHostToPortal(session);
-                System.out.println("====================================\n");
-
-                // Se detiene para no seguir procesando el paquete
-                return Command.STOP;
-            }
-            
-
             // Condición de captura:
             //  - Host con IP válida y estado SEEN_WITH_IP
-            //  - Tráfico hacia cualquier destino que NO sea el portal (ej: quiere ir a internet)
+            //  - Tráfico hacia cualquier destino que NO sea el portal
             if (session.state == HostState.SEEN_WITH_IP &&
                 dstIp != null && !dstIp.equals(PORTAL_IP)) {
 
@@ -372,13 +348,10 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                 captureHostToPortal(session);
 
                 System.out.println("====================================\n");
-                // Este paquete en particular se puede descartar;
-                // el host reenviará y ya encontrará los flujos instalados.
                 return Command.STOP;
             }
 
-            // Si el tráfico ya va al portal (dstIp == PORTAL_IP) y aún no tiene flows,
-            // también lo capturamos aquí.
+            // Si el tráfico ya va al portal (dstIp == PORTAL_IP) y aún no tiene flows
             if (session.state == HostState.SEEN_WITH_IP &&
                 dstIp != null && dstIp.equals(PORTAL_IP)) {
 
@@ -390,8 +363,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                 System.out.println("====================================\n");
                 return Command.STOP;
             }
-
-            // Cualquier otro tráfico IPv4 que no entre en los casos anteriores queda bloqueado
         }
 
         System.out.println("====================================\n");
@@ -411,9 +382,9 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
             return;
         }
 
-        DatapathId srcSw  = s.switchId;
+        DatapathId srcSw   = s.switchId;
         OFPort     srcPort = s.port;
-        DatapathId dstSw  = PORTAL_SWITCH;
+        DatapathId dstSw   = PORTAL_SWITCH;
         OFPort     dstPort = PORTAL_PORT;
 
         System.out.println("Obteniendo ruta desde host " + s.ip +
@@ -434,6 +405,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
         System.out.println("Ruta obtenida host " + s.ip + " → portal: " + path);
 
+        // IPv4 + ARP a lo largo de la ruta
         installBidirectionalPortalFlowsAlongPath(path, s.ip);
 
         s.state = HostState.CAPTURED_TO_PORTAL;
@@ -445,8 +417,8 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
     }
 
     /**
-     * Instala flujos host ↔ portal en TODOS los switches de la ruta.
-     * La ruta es una lista de NodePortTuple con pares (inPort, outPort) por switch.
+     * Instala flujos host ↔ portal en TODOS los switches de la ruta
+     * (IPv4 + ARP).
      */
     private void installBidirectionalPortalFlowsAlongPath(List<NodePortTuple> path,
                                                           IPv4Address clientIp) {
@@ -465,7 +437,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
             NodePortTuple nptOut = path.get(i + 1); // (mismo switch, puerto salida al siguiente)
 
             DatapathId swId  = nptIn.getNodeId();
-            OFPort outPort   = nptOut.getPortId();
+            OFPort     outPort = nptOut.getPortId();
 
             IOFSwitch sw = switchService.getSwitch(swId);
             if (sw == null) {
@@ -473,16 +445,19 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                 continue;
             }
 
+            // IPv4
             installPortalFlow(sw, clientIp, outPort, true);
+            // ARP
+            installArpFlow(sw, clientIp, outPort, true);
         }
 
         // ------------ SENTIDO PORTAL → CLIENTE ------------
         for (int i = path.size() - 1; i > 0; i -= 2) {
-            NodePortTuple nptIn  = path.get(i);     // (switch, puerto ingreso en este sentido)
-            NodePortTuple nptOut = path.get(i - 1); // (mismo switch, puerto salida hacia hop anterior)
+            NodePortTuple nptIn  = path.get(i);
+            NodePortTuple nptOut = path.get(i - 1);
 
             DatapathId swId  = nptIn.getNodeId();
-            OFPort outPort   = nptOut.getPortId();
+            OFPort     outPort = nptOut.getPortId();
 
             IOFSwitch sw = switchService.getSwitch(swId);
             if (sw == null) {
@@ -490,12 +465,15 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                 continue;
             }
 
+            // IPv4
             installPortalFlow(sw, clientIp, outPort, false);
+            // ARP
+            installArpFlow(sw, clientIp, outPort, false);
         }
     }
 
     /**
-     * Instala un flujo unidireccional en el switch:
+     * Instala un flujo unidireccional IPv4 en el switch:
      *  - clientToPortal = true  → match: SRC=clientIp, DST=PORTAL_IP, out=egressPort
      *  - clientToPortal = false → match: SRC=PORTAL_IP, DST=clientIp, out=egressPort
      */
@@ -504,12 +482,11 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                                    OFPort egressPort,
                                    boolean clientToPortal) {
 
-        System.out.println("Creando FLOW " +
+        System.out.println("Creando FLOW IPv4 " +
                 (clientToPortal ? "CLIENTE→PORTAL" : "PORTAL→CLIENTE") +
                 " para host " + clientIp + " en switch " + sw.getId() +
                 " (outPort=" + egressPort + ")");
 
-        // Match de L3 (no filtramos por puerto de entrada)
         Match match;
         if (clientToPortal) {
             match = sw.getOFFactory().buildMatch()
@@ -525,11 +502,9 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
                     .build();
         }
 
-        // Acción: enviar al puerto correcto
         List<OFAction> actions = new ArrayList<OFAction>();
         actions.add(sw.getOFFactory().actions().output(egressPort, 0xFFFF));
 
-        // Instrucción Apply-Actions
         OFInstruction applyActions =
                 sw.getOFFactory().instructions().applyActions(actions);
 
@@ -547,7 +522,61 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
         sw.write(flowAdd);
 
-        System.out.println("FLOW instalado en switch " + sw.getId() +
+        System.out.println("FLOW IPv4 instalado en switch " + sw.getId() +
+                           " (outPort=" + egressPort + ").");
+    }
+
+    /**
+     * NUEVO: Instala un flujo unidireccional ARP en el switch:
+     *  - clientToPortal = true  → match: ARP_SPA=clientIp, ARP_TPA=PORTAL_IP
+     *  - clientToPortal = false → match: ARP_SPA=PORTAL_IP, ARP_TPA=clientIp
+     */
+    private void installArpFlow(IOFSwitch sw,
+                                IPv4Address clientIp,
+                                OFPort egressPort,
+                                boolean clientToPortal) {
+
+        System.out.println("Creando FLOW ARP " +
+                (clientToPortal ? "CLIENTE→PORTAL" : "PORTAL→CLIENTE") +
+                " para host " + clientIp + " en switch " + sw.getId() +
+                " (outPort=" + egressPort + ")");
+
+        Match match;
+        if (clientToPortal) {
+            match = sw.getOFFactory().buildMatch()
+                    .setExact(MatchField.ETH_TYPE, EthType.ARP)
+                    .setExact(MatchField.ARP_SPA, clientIp)
+                    .setExact(MatchField.ARP_TPA, PORTAL_IP)
+                    .build();
+        } else {
+            match = sw.getOFFactory().buildMatch()
+                    .setExact(MatchField.ETH_TYPE, EthType.ARP)
+                    .setExact(MatchField.ARP_SPA, PORTAL_IP)
+                    .setExact(MatchField.ARP_TPA, clientIp)
+                    .build();
+        }
+
+        List<OFAction> actions = new ArrayList<OFAction>();
+        actions.add(sw.getOFFactory().actions().output(egressPort, 0xFFFF));
+
+        OFInstruction applyActions =
+                sw.getOFFactory().instructions().applyActions(actions);
+
+        List<OFInstruction> instructions = new ArrayList<OFInstruction>();
+        instructions.add(applyActions);
+
+        OFFlowAdd flowAdd = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setHardTimeout(FLOW_HARD_TIMEOUT)
+                .setIdleTimeout(FLOW_IDLE_TIMEOUT)
+                .setPriority(FLOW_PRIORITY)
+                .setMatch(match)
+                .setInstructions(instructions)
+                .build();
+
+        sw.write(flowAdd);
+
+        System.out.println("FLOW ARP instalado en switch " + sw.getId() +
                            " (outPort=" + egressPort + ").");
     }
 
@@ -555,12 +584,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
     //                        DHCP y ARP
     // =========================================================
 
-    /**
-     * Reenvía el paquete DHCP a todos los puertos del switch usando OFPP_FLOOD.
-     * Como todos los switches tienen regla table-miss hacia el controlador,
-     * esto hace que el paquete vaya saltando switch por switch hasta llegar
-     * al servidor DHCP y luego de vuelta al cliente.
-     */
     private void floodDhcpPacket(IOFSwitch sw,
                                  OFPacketIn pi,
                                  OFPort inPort,
@@ -588,9 +611,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         sw.write(pob.build());
     }
 
-    /**
-     * FLOOD para paquetes ARP (necesario para que DHCP, gateway, portal, etc. funcionen).
-     */
     private void floodArpPacket(IOFSwitch sw,
                                 OFPacketIn pi,
                                 OFPort inPort) {
@@ -649,6 +669,6 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         System.out.println("=== PacketInManager cargado ===");
         System.out.println("    - Manejo de DHCP + ARP");
         System.out.println("    - Captura a portal cautivo " + PORTAL_IP +
-                           " mediante instalación de flujos multi-switch");
+                           " mediante instalación de flujos multi-switch (IPv4 + ARP)");
     }
 }
