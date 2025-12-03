@@ -159,19 +159,40 @@ def logout():
 # LÓGICA DE LOGIN COMPLETO
 # ============================================================
 def finalizar_login(username, ip, rol):
-
+    # 1. Registro de inicio de sesión en RADIUS (Accounting)
     enviar_accounting_start(username, ip)
 
-    if autorizar_en_floodlight(ip, rol):
+    # 2. Obtener las políticas específicas desde la BD (Tu nueva función)
+    # Nota: 'rol' es el que el usuario seleccionó o el que tenía por defecto
+    recursos_autorizados = obtener_recursos_autorizados_por_rol(username, rol)
+    
+    # 3. Enviar todo a Floodlight
+    # Intentamos aplicar las políticas ACL complejas
+    print(f"[SDN] Aplicando políticas para {username} ({ip}) con rol {rol}: {recursos_autorizados}")
+    exito_acl = enviar_politicas_a_floodlight(ip, recursos_autorizados)
+    
+    # Opcional: Mantener tu antigua llamada 'autorizar_en_floodlight' si hacía otra cosa 
+    # (como el etiquetado básico en Tabla 0), o integrarla aquí.
+    # Por ahora asumiremos que el nuevo endpoint hace todo el trabajo.
+    
+    if exito_acl:
+        # 4. Crear sesión local en Flask
         session['user_logged_in'] = username
         session['role_active'] = rol
         session['user_ip'] = ip
+        
+        # Limpiar variables temporales
         session.pop('temp_user', None)
         session.pop('temp_roles', None)
         session.pop('temp_ip', None)
+        
         return redirect(url_for('index'))
-
-    return render_template('login.html', error="Error SDN.")
+    else:
+        # Si falla el controlador, decides si bloqueas al usuario o lo dejas pasar con permisos mínimos
+        # Para seguridad estricta: retornamos error.
+        revocar_en_floodlight(ip) # Por si acaso
+        enviar_accounting_stop(username, ip)
+        return render_template('login.html', error="Error aplicando políticas de red. Contacte a DTI.")
 
 
 # ============================================================
@@ -601,6 +622,75 @@ def obtener_todos_los_usuarios():
     except Exception as e:
         print("ERROR obtener_todos:", e)
         return []
+        
+        
+        
+def obtener_recursos_autorizados_por_rol(username, radius_role):
+    """
+    Retorna una lista de diccionarios únicos con los recursos permitidos.
+    Ejemplo: [{'ip': '10.0.0.80', 'port': 80, 'proto': 'tcp'}, ...]
+    """
+    recursos_unicos = []
+    
+    try:
+        conn = mysql.connector.connect(**DB_SDN)
+        cur = conn.cursor()
+
+        query = """
+            SELECT res.server_ip, res.server_port, res.protocol
+            FROM resources res
+            JOIN resources_roles rr ON res.id = rr.resource_id
+            JOIN roles r ON rr.role_id = r.id
+            WHERE r.role_name = %s
+        """
+        
+        # Ejecutamos pasando los parámetros en orden: (rol, usuario, usuario)
+        cur.execute(query, (radius_role,))
+        
+        for (ip, port, proto) in cur.fetchall():
+            # Convertimos 'any' a None para que sea fácil de procesar luego
+            protocolo_final = proto if proto != 'any' else None
+            
+            recursos_unicos.append({
+                "ip": ip,
+                "port": port,
+                "protocol": protocolo_final
+            })
+            
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error consultando recursos SDN: {e}")
+        
+    return recursos_unicos
+
+
+
+def enviar_politicas_a_floodlight(user_ip, lista_recursos):
+    # Endpoint que definiremos en Java más adelante
+    url = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/resources/push"
+    
+    # Construimos el payload JSON final
+    payload = {
+        "user_ip": user_ip,
+        "resources": lista_recursos  # Es la lista de dicts que devuelve tu nueva función
+    }
+    
+    try:
+        # Enviamos POST al controlador con un timeout corto (para no colgar el portal)
+        resp = requests.post(url, json=payload, timeout=2)
+        
+        if resp.status_code == 200:
+            print(f"[SDN] Políticas aplicadas para {user_ip}")
+            return True
+        else:
+            print(f"[SDN] Error del controlador: {resp.status_code} - {resp.text}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[SDN] Fallo de conexión con Floodlight: {e}")
+        return False
+
 
 
 # ============================================================
