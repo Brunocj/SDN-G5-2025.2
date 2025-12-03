@@ -1,5 +1,25 @@
 package net.floodlightcontroller.packetinmanager;
 
+// Para solucionar el error de la línea 661
+import java.util.HashMap;
+
+// Para solucionar el error de la línea 730
+import org.projectfloodlight.openflow.types.VlanVid;
+import org.projectfloodlight.openflow.types.IPv6Address;
+import org.projectfloodlight.openflow.types.TableId;
+
+// Imports para Web y Servicio
+import net.floodlightcontroller.packetinmanager.web.AccessControlWebRoutable;
+import net.floodlightcontroller.packetinmanager.web.AllowedResource;
+
+// Imports para encontrar dispositivos (Servers)
+import net.floodlightcontroller.devicemanager.IDevice;
+import net.floodlightcontroller.devicemanager.IDeviceService;
+import net.floodlightcontroller.devicemanager.SwitchPort;
+
+// Imports para iteradores
+import java.util.Iterator;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -55,12 +75,13 @@ import net.floodlightcontroller.routing.IRoutingService;
 import net.floodlightcontroller.routing.Route;
 import net.floodlightcontroller.topology.NodePortTuple;
 
-public class PacketInManager implements IOFMessageListener, IFloodlightModule {
+public class PacketInManager implements IOFMessageListener, IFloodlightModule, IAccessControlService {
 
     protected IFloodlightProviderService floodlightProvider;
     protected IOFSwitchService           switchService;
     protected IRoutingService            routingService;
     protected IRestApiService restApiService;
+    protected IDeviceService             deviceManagerService;
 
 
     // =========================================================
@@ -244,12 +265,31 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
                         System.out.println("DHCP Message Type (opción 53) = " + msgTypeVal);
 
+                        
                         if (msgTypeVal == DHCPDISCOVER) {
                             System.out.println(">>> DHCP DISCOVER DETECTADO (HOST → SERVER) <<<");
-                            System.out.println("    From MAC : " + eth.getSourceMACAddress());
+
+                            // MAC de origen
+                            MacAddress srcMac = eth.getSourceMACAddress();
+                            System.out.println("    From MAC : " + srcMac);
                             System.out.println("    On switch: " + sw.getId() +
-                                               "  IN_PORT: " + inPort);
-                        } else if (msgTypeVal == DHCPACK) {
+                                            "  IN_PORT: " + inPort);
+
+                            // ======== Chequeo de MAC spoofing =========
+                            // SecurityHelper se encarga de la lógica interna
+                            boolean esSpoofing = SecurityHelper.checkMacSpoofing(srcMac.toString());
+
+                            if (esSpoofing) {
+                                System.out.println("[Security] ⚠ POSIBLE MAC SPOOFING detectado para MAC " + srcMac);
+                                // Por ahora solo lo imprimimos; más adelante aquí podrías:
+                                // - No reenviar el DHCP
+                                // - Marcar al host como sospechoso
+                                // - Bloquear el puerto, etc.
+                            } else {
+                                System.out.println("[Security] MAC " + srcMac +
+                                                " no presenta spoofing según sesiones_activas.");
+                            }
+                        }   else if (msgTypeVal == DHCPACK) {
                             // Aquí el servidor está confirmando la IP al cliente
                             IPv4Address clientIp = dhcp.getYourIPAddress();
                             System.out.println(">>> DHCP ACK DETECTADO <<<");
@@ -619,12 +659,16 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
     @Override
     public Collection<Class<? extends IFloodlightService>> getModuleServices() {
-        return null;
+        Collection<Class<? extends IFloodlightService>> l = new ArrayList<>();
+        l.add(IAccessControlService.class); // <--- AGREGAR
+        return l;
     }
 
     @Override
     public Map<Class<? extends IFloodlightService>, IFloodlightService> getServiceImpls() {
-        return null;
+        Map<Class<? extends IFloodlightService>, IFloodlightService> m = new HashMap<>();
+        m.put(IAccessControlService.class, this); // <--- AGREGAR
+        return m;
     }
 
     @Override
@@ -635,6 +679,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         deps.add(IOFSwitchService.class);
         deps.add(IRoutingService.class);
         deps.add(IRestApiService.class);   // 👈 NUEVO
+        deps.add(IDeviceService.class);    // 👈 NUEVO
         return deps;
     }
 
@@ -645,6 +690,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
         switchService      = context.getServiceImpl(IOFSwitchService.class);
         routingService     = context.getServiceImpl(IRoutingService.class);
         restApiService     = context.getServiceImpl(IRestApiService.class); // 👈 NUEVO
+        deviceManagerService = context.getServiceImpl(IDeviceService.class);// 👈 NUEVO
     }
 
 
@@ -659,6 +705,139 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule {
 
         // 👇 Aquí enganchas tus endpoints
         restApiService.addRestletRoutable(new SecurityWebRoutable());
+        restApiService.addRestletRoutable(new AccessControlWebRoutable());
+    }
+    
+    
+    // =========================================================
+    //        IMPLEMENTACIÓN DE IAccessControlService
+    // =========================================================
+
+    @Override
+    public void allowAccessToResources(IPv4Address userIp, List<AllowedResource> resources) {
+        System.out.println(">>> [ACL] Iniciando cálculo de rutas para usuario: " + userIp);
+
+        // 1. Localizar al Usuario (Source)
+        ClientSession session = clientSessions.get(userIp);
+        if (session == null) {
+            System.err.println("ERROR: Usuario " + userIp + " no encontrado en sesiones locales.");
+            return;
+        }
+        
+        DatapathId srcSwitch = session.switchId;
+        OFPort srcPort = session.port;
+
+        // 2. Procesar cada recurso
+        for (AllowedResource res : resources) {
+            try {
+                IPv4Address dstIp = IPv4Address.of(res.getIp());
+                
+                // 3. Localizar al Servidor/Recurso (Destination) usando DeviceManager
+                // (Esto es lo que hace Forwarding.java para saber dónde está el destino)
+                Iterator<? extends IDevice> devices = deviceManagerService.queryDevices(
+                        MacAddress.NONE, VlanVid.ZERO, dstIp, IPv6Address.NONE, DatapathId.NONE, OFPort.ZERO);
+
+                if (!devices.hasNext()) {
+                    System.out.println("WARN: Recurso " + dstIp + " no encontrado en la topología (DeviceManager).");
+                    continue; 
+                }
+
+                IDevice dstDevice = devices.next();
+                SwitchPort[] aps = dstDevice.getAttachmentPoints();
+                if (aps.length == 0) continue;
+
+                SwitchPort dstAp = aps[0]; // Tomamos su punto de conexión principal
+                DatapathId dstSwitch = dstAp.getSwitchDPID();
+                OFPort dstPort = dstAp.getPort();
+
+                System.out.println("   -> Ruta ACL: Usuario(" + srcSwitch + ") <--> Recurso(" + dstSwitch + ")");
+
+                // 4. Calcular Rutas (Ida y Vuelta)
+                Route routeOut = routingService.getRoute(srcSwitch, srcPort, dstSwitch, dstPort, U64.ZERO);
+                Route routeIn  = routingService.getRoute(dstSwitch, dstPort, srcSwitch, srcPort, U64.ZERO);
+
+                if (routeOut != null && routeIn != null) {
+                    // Instalar IDA (Usuario -> Servidor)
+                    installAclFlows(routeOut, userIp, dstIp, res.getProtocol(), res.getPort(), true);
+                    
+                    // Instalar VUELTA (Servidor -> Usuario)
+                    installAclFlows(routeIn, dstIp, userIp, res.getProtocol(), res.getPort(), false);
+                } else {
+                    System.err.println("ERROR: No hay ruta física entre " + srcSwitch + " y " + dstSwitch);
+                }
+
+            } catch (Exception e) {
+                System.err.println("Error procesando recurso " + res.getIp() + ": " + e.getMessage());
+            }
+        }
+
+        // 5. Liberar al usuario del Portal Cautivo
+        session.state = HostState.FULL_ACCESS;
+        System.out.println(">>> [ACL] Usuario " + userIp + " autorizado. Estado cambiado a FULL_ACCESS.");
+    }
+
+    /**
+     * Helper para instalar flujos a lo largo de una ruta (Basado en Forwarding.pushRoute)
+     */
+    private void installAclFlows(Route route, IPv4Address srcIp, IPv4Address dstIp, 
+                                 String proto, int tcpPort, boolean isForwardDirection) {
+        
+        List<NodePortTuple> path = route.getPath();
+        System.out.println("   [DEBUG] Instalando flujos en " + (path.size()/2) + " switches para " + srcIp + " -> " + dstIp);
+        // Iteramos switch por switch
+        for (int i = 0; i < path.size() - 1; i += 2) {
+            DatapathId dpid = path.get(i).getNodeId();
+            OFPort outPort = path.get(i+1).getPortId();
+            
+            IOFSwitch sw = switchService.getSwitch(dpid);
+            if (sw == null) {
+                System.out.println("   [ERROR] Switch " + dpid + " no encontrado. Saltando.");
+                continue;
+            }
+
+            Match.Builder mb = sw.getOFFactory().buildMatch();
+            mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+              .setExact(MatchField.IPV4_SRC, srcIp)
+              .setExact(MatchField.IPV4_DST, dstIp);
+
+            // Filtros de Capa 4 (Puerto)
+            if (proto != null && tcpPort > 0) {
+                if (proto.equalsIgnoreCase("tcp")) {
+                    mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+                    // Truco: Si es ida, el destino es el puerto 80. Si es vuelta, el origen es 80.
+                    if (isForwardDirection) {
+                        mb.setExact(MatchField.TCP_DST, TransportPort.of(tcpPort));
+                    } else {
+                        mb.setExact(MatchField.TCP_SRC, TransportPort.of(tcpPort));
+                    }
+                } else if (proto.equalsIgnoreCase("udp")) {
+                    mb.setExact(MatchField.IP_PROTO, IpProtocol.UDP);
+                    if (isForwardDirection) {
+                        mb.setExact(MatchField.UDP_DST, TransportPort.of(tcpPort));
+                    } else {
+                        mb.setExact(MatchField.UDP_SRC, TransportPort.of(tcpPort));
+                    }
+                }
+            }
+
+            // Acción: Salida por el puerto calculado por el RoutingService
+            List<OFAction> actions = new ArrayList<>();
+            actions.add(sw.getOFFactory().actions().output(outPort, Integer.MAX_VALUE));
+
+            OFFlowAdd flow = sw.getOFFactory().buildFlowAdd()
+                .setMatch(mb.build())
+                .setTableId(TableId.of(2))
+                .setActions(actions)
+                .setPriority(500)      // Prioridad mayor que el default
+                .setIdleTimeout(3600)  // 1 hora de inactividad
+                .setHardTimeout(0)
+                .build();
+
+            sw.write(flow);
+            
+            // LOG DE CONFIRMACIÓN
+            System.out.println("   [FLOW] Instalado en SW " + dpid + " | OutPort: " + outPort + " | Match: " + srcIp + "->" + dstIp + ":" + tcpPort);
+        }
     }
 
 
