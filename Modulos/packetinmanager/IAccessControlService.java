@@ -7,4 +7,6 @@ import org.projectfloodlight.openflow.types.IPv4Address;
 
 public interface IAccessControlService extends IFloodlightService {
     void allowAccessToResources(IPv4Address userIp, List<AllowedResource> resources);
+    void revokeAccess(IPv4Address userIp); // <--- NUEVO METODO
+    void blockIpAddress(IPv4Address targetIp);
 }

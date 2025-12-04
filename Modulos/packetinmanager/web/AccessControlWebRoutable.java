@@ -8,7 +8,8 @@ public class AccessControlWebRoutable implements RestletRoutable {
     @Override
     public Router getRestlet(Context context) {
         Router router = new Router(context);
-        router.attach("/push", ResourcePushResource.class); // URL final: /wm/resources/push
+        router.attach("/push", ResourcePushResource.class);
+        router.attach("/revoke", ResourceRevokeResource.class); // <--- NUEVO
         return router;
     }
 

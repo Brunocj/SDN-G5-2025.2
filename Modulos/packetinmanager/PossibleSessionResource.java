@@ -11,7 +11,6 @@ public class PossibleSessionResource extends ServerResource {
     @Get("json")
     public Map<String, Object> getPossibleSession() {
         String ip = getQueryValue("ip");
-
         Map<String, Object> resp = new HashMap<>();
 
         if (ip == null || ip.isEmpty()) {
@@ -23,9 +22,18 @@ public class PossibleSessionResource extends ServerResource {
         String[] params = SecurityHelper.obtenerParametrosDesdePosibles(ip);
 
         if (params == null) {
+            // 👈 hubo error SQL
             resp.put("success", false);
-            resp.put("error", "No se encontró posible_sesion para esa IP");
             resp.put("ip", ip);
+            resp.put("error", "Error interno al consultar la base de datos (revisar logs de SesionesDB)");
+            return resp;
+        }
+
+        if (params.length == 0) {
+            // 👈 no hay fila
+            resp.put("success", false);
+            resp.put("ip", ip);
+            resp.put("error", "No se encontró posible_sesion para esa IP");
             return resp;
         }
 

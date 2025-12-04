@@ -250,29 +250,81 @@ public class SecurityHelper {
     }
 
     /**
-     * Verifica si existe una sesión activa con la combinación
-     * IP + MAC + switchid + inport dada.
+     * Verificación completa de sesión:
      *
-     * Semántica:
-     *  - Devuelve false si SÍ existe una sesión con esa combinación
-     *    (es decir, parece consistente, no hay spoofing).
-     *  - Devuelve true si NO existe ninguna sesión con esos datos
-     *    (posible spoofing o sesión no registrada / incoherente).
+     *  1 → Spoofing:
+     *      - Existe IP o MAC en la BD, pero NO coincide switchid/inport
+     *        o el otro campo.
      *
-     * @param ip       IP a verificar (ej. "10.0.0.5")
-     * @param mac      MAC a verificar (ej. "aa:bb:cc:dd:ee:ff")
-     * @param switchid DPID del switch donde se ve al host (como String)
-     * @param inport   Puerto de entrada donde se ve al host (como String)
-     * @return true  si NO se encontró coincidencia (potencial spoofing)
-     *         false si SÍ hay una sesión con esa IP, MAC, switchid e inport
+     *  2 → OK (solicita flows):
+     *      - Coincidencia EXACTA de IP + MAC + switchid + inport
+     *
+     *  3 → Error de usuario:
+     *      - NO existe ni la IP ni la MAC en la BD
+     *
      */
-    public static boolean checkIpMacSwitchSpoofing(String ip,
-                                                String mac,
-                                                String switchid,
-                                                String inport) {
+    public static int verificarSesion(String ip,
+                                    String mac,
+                                    String switchid,
+                                    String inport) {
+
+        boolean ipExiste  = existeIp(ip);
+        boolean macExiste = existeMac(mac);
+
+        // CASO 3 → ERROR USUARIO (no existe IP NI MAC)
+        if (!ipExiste && !macExiste) {
+            System.out.println("[SesionesDB] Caso 3: ERROR_USUARIO – No existe IP ni MAC");
+            return 3;
+        }
+
+        // CASO 2 → OK (coincidencia completa)
+        if (existeCoincidenciaCompleta(ip, mac, switchid, inport)) {
+            System.out.println("[SesionesDB] Caso 2: OK – Coincidencia exacta");
+            return 2;
+        }
+
+        // CASO 1 → SPOOFING
+        System.out.println("[SesionesDB] Caso 1: SPOOFING – IP o MAC existe, pero no coincide todo");
+        return 1;
+    }
+
+    private static boolean existeIp(String ip) {
+        String sql = "SELECT 1 FROM sesiones_activas WHERE ip = ? LIMIT 1";
+        try (Connection conn = getConnection();
+            PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, ip);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    private static boolean existeMac(String mac) {
+        String sql = "SELECT 1 FROM sesiones_activas WHERE mac = ? LIMIT 1";
+        try (Connection conn = getConnection();
+            PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, mac);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        } catch (SQLException e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    private static boolean existeCoincidenciaCompleta(String ip,
+                                                    String mac,
+                                                    String switchid,
+                                                    String inport) {
+
         String sql = "SELECT 1 FROM sesiones_activas " +
-                    "WHERE ip = ? AND mac = ? AND switchid = ? AND inport = ? " +
-                    "LIMIT 1";
+                    "WHERE ip=? AND mac=? AND switchid=? AND inport=? LIMIT 1";
 
         try (Connection conn = getConnection();
             PreparedStatement ps = conn.prepareStatement(sql)) {
@@ -283,27 +335,42 @@ public class SecurityHelper {
             ps.setString(4, inport);
 
             try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    // Hay una sesión activa con esa combinación completa
-                    System.out.println("[SesionesDB] IP+MAC+switchid+inport válidos en sesiones_activas: "
-                                    + ip + " / " + mac + " / " + switchid + " / " + inport);
-                    return false; // NO spoofing
-                } else {
-                    System.out.println("[SesionesDB] NO se encontró IP+MAC+switchid+inport en sesiones_activas: "
-                                    + ip + " / " + mac + " / " + switchid + " / " + inport +
-                                    " → posible spoofing o sesión incoherente.");
-                    return true; // posible spoofing
-                }
+                return rs.next();
             }
 
         } catch (SQLException e) {
-            System.err.println("[SesionesDB] ERROR en checkIpMacSwitchSpoofing(" +
-                            ip + ", " + mac + ", " + switchid + ", " + inport + ")");
             e.printStackTrace();
-            // Por seguridad, tratamos el error como potencialmente sospechoso
-            return true;
+            return false;
         }
     }
 
+    /**
+     * Elimina una sesión activa basada en la IP.
+     * Se usa cuando el usuario hace Logout en el portal.
+     *
+     * @param ip IP del usuario que cierra sesión (ej. "10.0.0.5")
+     */
+    public static void eliminarSesionActiva(String ip) {
+        String sql = "DELETE FROM sesiones_activas WHERE ip = ?";
+
+        try (Connection conn = getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, ip);
+
+            int filas = ps.executeUpdate();
+            
+            if (filas > 0) {
+                System.out.println("[SesionesDB] Logout exitoso. Sesión eliminada para IP: " + ip);
+            } else {
+                System.out.println("[SesionesDB] Intento de Logout para IP " + ip + 
+                                   ", pero no existía en sesiones_activas.");
+            }
+
+        } catch (SQLException e) {
+            System.err.println("[SesionesDB] ERROR al eliminar sesión activa para IP: " + ip);
+            e.printStackTrace();
+        }
+    }
 
 }

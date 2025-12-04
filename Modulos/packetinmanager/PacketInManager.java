@@ -1,23 +1,18 @@
 package net.floodlightcontroller.packetinmanager;
 
-// Para solucionar el error de la línea 661
 import java.util.HashMap;
 
-// Para solucionar el error de la línea 730
 import org.projectfloodlight.openflow.types.VlanVid;
 import org.projectfloodlight.openflow.types.IPv6Address;
 import org.projectfloodlight.openflow.types.TableId;
 
-// Imports para Web y Servicio
 import net.floodlightcontroller.packetinmanager.web.AccessControlWebRoutable;
 import net.floodlightcontroller.packetinmanager.web.AllowedResource;
 
-// Imports para encontrar dispositivos (Servers)
 import net.floodlightcontroller.devicemanager.IDevice;
 import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.devicemanager.SwitchPort;
 
-// Imports para iteradores
 import java.util.Iterator;
 
 import java.util.ArrayList;
@@ -27,6 +22,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.HashSet;
+
 import net.floodlightcontroller.restserver.IRestApiService;
 import net.floodlightcontroller.restserver.RestletRoutable;
 
@@ -43,7 +40,7 @@ import org.projectfloodlight.openflow.protocol.action.OFAction;
 import org.projectfloodlight.openflow.protocol.instruction.OFInstruction;
 import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
-
+import org.projectfloodlight.openflow.protocol.OFFlowDelete;
 import org.projectfloodlight.openflow.types.DatapathId;
 import org.projectfloodlight.openflow.types.EthType;
 import org.projectfloodlight.openflow.types.OFPort;
@@ -75,7 +72,11 @@ import net.floodlightcontroller.routing.IRoutingService;
 import net.floodlightcontroller.routing.Route;
 import net.floodlightcontroller.topology.NodePortTuple;
 
-public class PacketInManager implements IOFMessageListener, IFloodlightModule, IAccessControlService {
+import net.floodlightcontroller.core.IOFSwitchListener;
+import org.projectfloodlight.openflow.protocol.OFPortDesc;
+import net.floodlightcontroller.core.PortChangeType;
+
+public class PacketInManager implements IOFMessageListener, IFloodlightModule, IAccessControlService, IOFSwitchListener {
 
     protected IFloodlightProviderService floodlightProvider;
     protected IOFSwitchService           switchService;
@@ -106,6 +107,10 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
     //  - PORTAL_IP: IP del servidor del portal cautivo
     //  - PORTAL_SWITCH: DPID del switch donde está conectado el portal
     //  - PORTAL_PORT: puerto del switch donde está conectado el portal
+    
+    // Identificador numérico para "Forwarding-Flow"
+    // Usamos 0xAC1 (Parece "ACL")
+    private static final long ACL_APP_ID = 0xAC1L;
 
     private static final IPv4Address PORTAL_IP =
             IPv4Address.of("10.0.0.7");
@@ -120,6 +125,11 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
     private static final int FLOW_PRIORITY      = 100;
     private static final int FLOW_IDLE_TIMEOUT  = 300; // segundos 
     private static final int FLOW_HARD_TIMEOUT  = 0;   // 0 = sin límite
+    // Flujos de bloqueo por spoofing (DROP en el puerto, tabla 0)
+    // TTL FIJO: 30 min vía HARD_TIMEOUT (no por idle)
+    private static final int SPOOFING_DROP_PRIORITY     = 65000; // muy alta
+    private static final int SPOOFING_DROP_IDLE_TIMEOUT = 0;     // no expira por inactividad
+    private static final int SPOOFING_DROP_HARD_TIMEOUT = 1800;  // 30 min = 30*60
 
     // =========================================================
     //               ESTRUCTURAS DE ESTADO POR HOST
@@ -148,6 +158,17 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
     // Hosts que están encaminados al portal (pendientes de autenticación de aplicación)
     private final Set<IPv4Address> portalPendingAuth =
             Collections.newSetFromMap(new ConcurrentHashMap<IPv4Address, Boolean>());
+
+    private static final Set<IPv4Address> IGNORED_IPS = new HashSet<>();
+
+    static {
+        // Servidor DHCP (para que sus PACKET_IN normales no pasen por la lógica de spoofing/portal)
+        IGNORED_IPS.add(IPv4Address.of(DHCP_SERVER_IP));
+
+        IGNORED_IPS.add(IPv4Address.of("20.0.0.3"));
+        IGNORED_IPS.add(IPv4Address.of("20.0.0.4"));
+        IGNORED_IPS.add(IPv4Address.of("20.0.0.5"));
+    }
 
     @Override
     public String getName() {
@@ -220,6 +241,11 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
             IPv4 ipv4 = (IPv4) eth.getPayload();
             IPv4Address srcIp = ipv4.getSourceAddress();
             IPv4Address dstIp = ipv4.getDestinationAddress();
+            // Necesarios para SecurityHelper.checkIpMacSwitchSpoofing(...)
+            String ipStr      = srcIp.toString();
+            String macStr     = eth.getSourceMACAddress().toString();
+            String switchStr  = sw.getId().toString();
+            String inportStr  = inPort.toString();
 
             System.out.println("--- IPv4 INFO ---");
             System.out.println("SRC IP        : " + srcIp);
@@ -281,10 +307,14 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
 
                             if (esSpoofing) {
                                 System.out.println("[Security] ⚠ POSIBLE MAC SPOOFING detectado para MAC " + srcMac);
-                                // Por ahora solo lo imprimimos; más adelante aquí podrías:
-                                // - No reenviar el DHCP
-                                // - Marcar al host como sospechoso
-                                // - Bloquear el puerto, etc.
+                                System.out.println("           → BLOQUEANDO puerto " + inPort + " en switch " + sw.getId());
+
+                                // Bloquear TODO el tráfico que entre por este puerto
+                                installSpoofingDropFlow(sw, inPort, "DHCP MAC spoofing");
+
+                                System.out.println("    No se reenvía este DHCP DISCOVER por spoofing.");
+                                System.out.println("====================================\n");
+                                return Command.STOP;  // cortamos aquí, NO se hace floodDhcpPacket
                             } else {
                                 System.out.println("[Security] MAC " + srcMac +
                                                 " no presenta spoofing según sesiones_activas.");
@@ -333,6 +363,17 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                 }
             }
 
+            // ==============================================
+            // 1.5) Lista de IPs a ignorar en análisis L3/L4
+            //      (NO afecta al tratamiento DHCP de arriba)
+            // ==============================================
+            if (srcIp != null && IGNORED_IPS.contains(srcIp)) {
+                System.out.println("[PacketInManager] SRC IP " + srcIp +
+                                   " está en IGNORED_IPS → se ignora análisis de spoofing/portal.");
+                System.out.println("====================================\n");
+                return Command.CONTINUE;
+            }
+
             // =====================================================
             // 2) Lógica de captura al portal cautivo mediante FLOWS
             // =====================================================
@@ -361,21 +402,66 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                 session.mac      = eth.getSourceMACAddress();
                 session.switchId = sw.getId();
                 session.port     = inPort;
-                session.state    = HostState.SEEN_WITH_IP; // Lo vemos ya con IPv4
+                session.state    = HostState.SEEN_WITH_IP;
                 session.lastSeenMillis = now;
                 clientSessions.put(srcIp, session);
+
                 System.out.println("Nueva sesión creada para host " + srcIp +
-                                   " en switch " + session.switchId +
-                                   " / puerto " + session.port);
+                                " en switch " + session.switchId +
+                                " / puerto " + session.port);
+
+                // ⭐ CREAR POSIBLE SESIÓN EN BD SOLO UNA VEZ
+                SessionHelper.crearEntrada(
+                    srcIp.toString(),
+                    eth.getSourceMACAddress().toString(),
+                    sw.getId().toString(),
+                    inPort.toString()
+                );
+
             } else {
-                // Actualizamos info dinámica
                 session.mac      = eth.getSourceMACAddress();
                 session.switchId = sw.getId();
                 session.port     = inPort;
                 session.lastSeenMillis = now;
+                // ⭐ CREAR POSIBLE SESIÓN EN BD SOLO UNA VEZ
+                SessionHelper.crearEntrada(
+                    srcIp.toString(),
+                    eth.getSourceMACAddress().toString(),
+                    sw.getId().toString(),
+                    inPort.toString()
+                );
+            }
 
-                if (session.state == null || session.state == HostState.UNKNOWN) {
-                    session.state = HostState.SEEN_WITH_IP;
+            // ==============================================
+            // 2.1) Chequeo de SPOOFING usando nueva función (1/2/3)
+            //     PERO: si el destino es el portal, NO se analiza spoofing
+            // ==============================================
+            if (dstIp != null && dstIp.equals(PORTAL_IP)) {
+                System.out.println("[Security] DST = PORTAL → no se analiza spoofing.");
+            } else {
+                int verificacion = SecurityHelper.verificarSesion(
+                        ipStr, macStr, switchStr, inportStr);
+
+                switch (verificacion) {
+
+                    case 1: // SPOOFING
+                        System.out.println("[Security] ⚠ SPOOFING detectado para host " + srcIp);
+                        installSpoofingDropFlow(sw, inPort, "SPOOFING detectado");
+                        System.out.println("====================================\n");
+                        return Command.STOP;
+
+                    case 2: // OK → sesión válida, permitir instalación/reinstalación de flows
+                        System.out.println("[Security] El usuario está solicitando flows");
+                        break;
+
+                    case 3: // ERROR USUARIO → no registrado → enviarlo a portal
+                        System.out.println("[Security] Usuario NO registrado (Caso 3).");
+                        // No se bloquea, simplemente continúa para ser capturado por el portal
+                        break;
+
+                    default:
+                        System.out.println("[Security] Error inesperado en verificarSesion().");
+                        break;
                 }
             }
 
@@ -699,6 +785,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
             throws FloodlightModuleException {
 
         floodlightProvider.addOFMessageListener(OFType.PACKET_IN, this);
+        switchService.addOFSwitchListener(this);
         System.out.println("=== PacketInManager cargado ===");
         System.out.println("    - Manejo de DHCP + ARP");
         System.out.println("    - Captura a portal cautivo");
@@ -724,6 +811,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
             return;
         }
         
+        MacAddress userMac = session.mac;
         DatapathId srcSwitch = session.switchId;
         OFPort srcPort = session.port;
 
@@ -758,10 +846,10 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
 
                 if (routeOut != null && routeIn != null) {
                     // Instalar IDA (Usuario -> Servidor)
-                    installAclFlows(routeOut, userIp, dstIp, res.getProtocol(), res.getPort(), true);
+                    installAclFlows(routeOut, userIp, dstIp, res.getProtocol(), res.getPort(), true, userMac, userIp);
                     
                     // Instalar VUELTA (Servidor -> Usuario)
-                    installAclFlows(routeIn, dstIp, userIp, res.getProtocol(), res.getPort(), false);
+                    installAclFlows(routeIn, dstIp, userIp, res.getProtocol(), res.getPort(), false, userMac, userIp);
                 } else {
                     System.err.println("ERROR: No hay ruta física entre " + srcSwitch + " y " + dstSwitch);
                 }
@@ -770,20 +858,30 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                 System.err.println("Error procesando recurso " + res.getIp() + ": " + e.getMessage());
             }
         }
-
-        // 5. Liberar al usuario del Portal Cautivo
-        session.state = HostState.FULL_ACCESS;
-        System.out.println(">>> [ACL] Usuario " + userIp + " autorizado. Estado cambiado a FULL_ACCESS.");
     }
 
     /**
      * Helper para instalar flujos a lo largo de una ruta (Basado en Forwarding.pushRoute)
      */
     private void installAclFlows(Route route, IPv4Address srcIp, IPv4Address dstIp, 
-                                 String proto, int tcpPort, boolean isForwardDirection) {
+                                 String proto, int tcpPort, boolean isForwardDirection,
+                                 MacAddress userMac, IPv4Address ownerIp) {
         
         List<NodePortTuple> path = route.getPath();
         System.out.println("   [DEBUG] Instalando flujos en " + (path.size()/2) + " switches para " + srcIp + " -> " + dstIp);
+        
+        // 1. GENERAR COOKIE COMPUESTO: [ APP_ID (32 bits) | IP_USUARIO (32 bits) ]
+    
+        // Obtenemos el valor numérico de la IP (asegurando que sea positivo con & 0xFFFFFFFFL)
+        long ipValue = ownerIp.getInt() & 0xFFFFFFFFL;
+        
+        // Combinamos: Desplazamos el AppID 32 bits a la izquierda y sumamos la IP
+        long rawCookie = (ACL_APP_ID << 32) | ipValue;
+        
+        U64 flowCookie = U64.of(rawCookie);
+    
+        System.out.println("   [DEBUG] Cookie Generado: " + Long.toHexString(rawCookie));
+        
         // Iteramos switch por switch
         for (int i = 0; i < path.size() - 1; i += 2) {
             DatapathId dpid = path.get(i).getNodeId();
@@ -799,7 +897,20 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
             mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
               .setExact(MatchField.IPV4_SRC, srcIp)
               .setExact(MatchField.IPV4_DST, dstIp);
+              
 
+            // --- NUEVO: AGREGAR MAC ---
+            if (userMac != null) {
+                if (isForwardDirection) {
+                    // IDA: El usuario es el origen
+                    mb.setExact(MatchField.ETH_SRC, userMac);
+                } else {
+                    // VUELTA: El usuario es el destino
+                    mb.setExact(MatchField.ETH_DST, userMac);
+                }
+            }
+            
+            
             // Filtros de Capa 4 (Puerto)
             if (proto != null && tcpPort > 0) {
                 if (proto.equalsIgnoreCase("tcp")) {
@@ -830,6 +941,7 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                 .setActions(actions)
                 .setPriority(500)      // Prioridad mayor que el default
                 .setIdleTimeout(3600)  // 1 hora de inactividad
+                .setCookie(flowCookie) // <--- AQUÍ ASIGNAMOS EL NOMBRE NUMÉRICO
                 .setHardTimeout(0)
                 .build();
 
@@ -840,5 +952,260 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
         }
     }
 
+    private void installSpoofingDropFlow(IOFSwitch sw, OFPort inPort, String reason) {
+        if (sw == null || inPort == null) {
+            System.out.println("[Security] No se puede instalar DROP: switch o puerto nulos.");
+            return;
+        }
 
+        System.out.println("[Security] Instalando FLOW de DROP por spoofing en switch " +
+                        sw.getId() + " puerto " + inPort + " (" + reason + ")");
+
+        Match match = sw.getOFFactory().buildMatch()
+                .setExact(MatchField.IN_PORT, inPort)  // TODO lo que entre por ese puerto
+                .build();
+
+        // Sin acciones = DROP
+        List<OFInstruction> instructions = new ArrayList<>();
+
+        OFFlowAdd dropFlow = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setTableId(TableId.of(0))                    // 👈 TABLA 0 explícita
+                .setHardTimeout(SPOOFING_DROP_HARD_TIMEOUT)   // 👈 30 min fijos
+                .setIdleTimeout(SPOOFING_DROP_IDLE_TIMEOUT)   // 👈 0 = no depende de idle
+                .setPriority(SPOOFING_DROP_PRIORITY)
+                .setMatch(match)
+                .setInstructions(instructions)
+                .build();
+
+        sw.write(dropFlow);
+
+        System.out.println("[Security] Flow de DROP por spoofing instalado en " +
+                        sw.getId() + " / puerto " + inPort + " (tabla 0, TTL=30min).");
+    }
+    
+    @Override
+    public void revokeAccess(IPv4Address userIp) {
+        System.out.println(">>> [ACL] Revocando acceso para usuario: " + userIp);
+        
+        // 1. Recalcular el mismo Cookie Compuesto
+        long ipValue = userIp.getInt() & 0xFFFFFFFFL;
+        long rawCookie = (ACL_APP_ID << 32) | ipValue;
+        U64 flowCookie = U64.of(rawCookie);
+        
+        U64 cookieMask = U64.NO_MASK; // Coincidencia exacta
+
+        // 2. Mandar orden de borrado a TODOS los switches
+        // (Es más seguro borrar en todos por si el usuario se movió)
+        for (DatapathId dpid : switchService.getAllSwitchDpids()) {
+            IOFSwitch sw = switchService.getSwitch(dpid);
+            if (sw == null) continue;
+
+            OFFlowDelete flowDelete = sw.getOFFactory().buildFlowDelete()
+                    .setTableId(TableId.of(2)) // Borrar de la Tabla 2 (donde pusimos las ACLs)
+                    .setCookie(flowCookie)
+                    .setCookieMask(cookieMask) // IMPORTANTE: Sin esto, borra todo
+                    .build();
+            
+            sw.write(flowDelete);
+            System.out.println("   [REVOKE] Enviado FlowDelete a SW " + dpid + " para cookie " + flowCookie);
+        }
+
+        // 3. Resetear estado de la sesión local
+        ClientSession session = clientSessions.get(userIp);
+        if (session != null) {
+            session.state = HostState.SEEN_WITH_IP; // Lo devolvemos al estado inicial (sin acceso)
+            // Opcional: session.state = HostState.CAPTURED_TO_PORTAL; si quieres forzar portal inmediato
+        }
+    }
+
+    // =========================================================
+    //        IMPLEMENTACIÓN DE IOFSwitchListener
+    // =========================================================
+
+    @Override
+    public void switchAdded(DatapathId switchId) {
+        // No hacemos nada aquí, esperamos a que se active
+    }
+
+    @Override
+    public void switchRemoved(DatapathId switchId) {
+    }
+
+    @Override
+    public void switchActivated(DatapathId switchId) {
+        // ⭐ AQUÍ ES DONDE INSTALAMOS LA REGLA PERSISTENTE
+        IOFSwitch sw = switchService.getSwitch(switchId);
+        if (sw != null) {
+            installDropMulticastFlow(sw);
+        }
+    }
+
+    @Override
+    public void switchPortChanged(DatapathId switchId, OFPortDesc port, PortChangeType type) {
+    }
+
+    @Override
+    public void switchChanged(DatapathId switchId) {
+    }
+
+    /**
+     * Instala una regla en Tabla 0 para descartar tráfico Multicast (224.0.0.0/4)
+     * Esto evita que el controlador se inunde de Packet-In de Avahi/mDNS.
+     */
+    private void installDropMulticastFlow(IOFSwitch sw) {
+        System.out.println("[PacketInManager] Instalando regla DROP Multicast en Switch " + sw.getId());
+
+        // Match: Todo lo que sea IPv4 destino 224.0.0.0 con máscara de red /4
+        // Esto cubre desde 224.0.0.0 hasta 239.255.255.255
+        Match match = sw.getOFFactory().buildMatch()
+                .setExact(MatchField.ETH_TYPE, EthType.IPv4)
+                .setMasked(MatchField.IPV4_DST, IPv4Address.of("224.0.0.0"), IPv4Address.of("240.0.0.0"))
+                .build();
+
+        // Sin acciones = DROP
+        List<OFInstruction> instructions = new ArrayList<>();
+
+        OFFlowAdd dropFlow = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setTableId(TableId.of(0))
+                .setPriority(1000) // Prioridad media-alta (más que el default, menos que ARP o seguridad crítica)
+                .setHardTimeout(0) // Permanente
+                .setIdleTimeout(0) // Permanente
+                .setMatch(match)
+                .setInstructions(instructions)
+                .build();
+
+        sw.write(dropFlow);
+
+            // BLOQUEAR MULTICAST IPv6 (ff00::/8)
+        Match match6 = sw.getOFFactory().buildMatch()
+                .setExact(MatchField.ETH_TYPE, EthType.IPv6)
+                // IPv6 Multicast siempre empieza por ff00...
+                .setMasked(MatchField.IPV6_DST, 
+                        IPv6Address.of("ff00::"), 
+                        IPv6Address.of("ff00::")) 
+                .build();
+
+        OFFlowAdd dropFlow6 = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setTableId(TableId.of(0))
+                .setPriority(1000)
+                .setHardTimeout(0)
+                .setIdleTimeout(0)
+                .setMatch(match6)
+                .setInstructions(instructions) // Lista vacía = DROP
+                .build();
+
+        sw.write(dropFlow6);
+    }
+
+    /**
+     * Bloquea una IP buscando su ubicación física en la BD si es necesario.
+     * Método mejorado para defensa DDoS y R1.
+     */
+    /**
+     * Bloquea al atacante. 
+     * CORREGIDO: Busca el puerto en la BD porque el objeto en RAM no lo tiene.
+     */
+    public void blockIpAddress(IPv4Address targetIp) {
+        System.out.println("[SECURITY] 🚨 Iniciando protocolo de bloqueo para IP: " + targetIp);
+
+        IOFSwitch targetSwitch = null;
+        OFPort targetPort = null;
+
+        // PASO 1: Consultar la Base de Datos (posibles_sesiones)
+        // Usamos esto PRIMERO porque aquí sí tenemos el puerto físico registrado.
+        try {
+            // [0]=ip, [1]=mac, [2]=switchid, [3]=inport
+            String[] datosFisicos = SecurityHelper.obtenerParametrosDesdePosibles(targetIp.toString());
+
+            if (datosFisicos != null && datosFisicos.length > 0) {
+                // Parseamos Switch ID
+                DatapathId dpid = DatapathId.of(datosFisicos[2]);
+                targetSwitch = switchService.getSwitch(dpid);
+                
+                // Parseamos Puerto Físico
+                int portNum = Integer.parseInt(datosFisicos[3]);
+                targetPort = OFPort.of(portNum);
+                
+                System.out.println("[SECURITY] ✅ Ubicación física confirmada en BD: Switch " + dpid + " - Puerto " + portNum);
+            }
+        } catch (Exception e) {
+            System.err.println("[SECURITY] Error consultando BD: " + e.getMessage());
+        }
+
+        // PASO 2: Si la BD falló, buscamos en Memoria (RAM) como respaldo
+        if (targetSwitch == null) {
+            ClientSession session = clientSessions.get(targetIp);
+            if (session != null) {
+                targetSwitch = switchService.getSwitch(session.switchId);
+                // NOTA: No intentamos leer session.inPort para evitar el error de compilación
+                System.out.println("[SECURITY] Ubicación parcial en RAM (Solo Switch, sin Puerto).");
+            }
+        }
+
+        // PASO 3: Ejecutar el Castigo
+        if (targetSwitch != null && targetPort != null) {
+            // OPCIÓN A: Bloqueo de Puerto (Corte de Cable - La mejor opción)
+            System.out.println("[SECURITY] ✂️ CORTANDO PUERTO " + targetPort + " en Switch " + targetSwitch.getId());
+            installPortDropFlow(targetSwitch, targetPort);
+            
+        } else if (targetSwitch != null) {
+            // OPCIÓN B: Bloqueo de IP en el Switch específico (Si no tenemos el puerto)
+            System.out.println("[SECURITY] 🛡️ Puerto desconocido. Bloqueando IP origen en Switch " + targetSwitch.getId());
+            installIpDropFlow(targetSwitch, targetIp);
+            
+        } else {
+            // OPCIÓN C: Bloqueo Global (Pánico)
+            System.out.println("[SECURITY] ⚠️ Ubicación desconocida. Aplicando BLOQUEO GLOBAL en todos los switches.");
+            Map<DatapathId, IOFSwitch> allSwitches = switchService.getAllSwitchMap();
+            for (IOFSwitch sw : allSwitches.values()) {
+                installIpDropFlow(sw, targetIp);
+            }
+        }
+    }
+
+    /**
+     * Instala una regla que descarta TODO lo que entra por un puerto específico.
+     * Efecto: Es como desconectar el cable del usuario.
+     */
+    private void installPortDropFlow(IOFSwitch sw, OFPort port) {
+        // Match: Todo lo que entre por IN_PORT
+        Match match = sw.getOFFactory().buildMatch()
+                .setExact(MatchField.IN_PORT, port) // <--- La clave del bloqueo físico
+                .build();
+
+        OFFlowAdd dropFlow = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setTableId(TableId.of(0))
+                .setPriority(6000)      // Prioridad EXTREMA (Mayor que IP Drop 5000)
+                .setHardTimeout(600)    // 10 minutos de castigo
+                .setIdleTimeout(0)
+                .setMatch(match)
+                .setInstructions(new ArrayList<OFInstruction>()) // DROP
+                .build();
+
+        sw.write(dropFlow);
+    }
+
+    // Mantén tu método antiguo como respaldo (renómbralo a installIpDropFlow)
+    private void installIpDropFlow(IOFSwitch sw, IPv4Address targetIp) {
+        Match match = sw.getOFFactory().buildMatch()
+                .setExact(MatchField.ETH_TYPE, EthType.IPv4)
+                .setExact(MatchField.IPV4_SRC, targetIp)
+                .build();
+
+        OFFlowAdd dropFlow = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setTableId(TableId.of(0))
+                .setPriority(5000)
+                .setHardTimeout(600)
+                .setIdleTimeout(0)
+                .setMatch(match)
+                .setInstructions(new ArrayList<OFInstruction>())
+                .build();
+
+        sw.write(dropFlow);
+    }
 }
