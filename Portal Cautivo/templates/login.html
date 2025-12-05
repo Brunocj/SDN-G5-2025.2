@@ -91,4 +91,59 @@
     </div>
 
 </body>
+
+<script>
+    document.addEventListener("DOMContentLoaded", function() {
+        // 1. Buscamos el mensaje de error y el botón
+        const errorDiv = document.querySelector('.error');
+        const submitBtn = document.querySelector('button[type="submit"]');
+
+        // Verificamos si hay un mensaje de bloqueo con tiempo
+        if (errorDiv && errorDiv.innerText.includes("espere")) {
+            
+            // 2. Extraemos el número usando Expresión Regular (Busca dígitos antes de 'segundos')
+            const match = errorDiv.innerText.match(/(\d+) segundos/);
+            
+            if (match) {
+                let seconds = parseInt(match[1]);
+
+                // 3. UX: Deshabilitar el botón para que no reinicien el contador por error
+                if(submitBtn) {
+                    submitBtn.disabled = true;
+                    submitBtn.innerHTML = `Bloqueado (${seconds}s)`;
+                    submitBtn.style.backgroundColor = "#ccc"; // Gris visual
+                    submitBtn.style.cursor = "not-allowed";
+                }
+
+                // 4. Iniciar el intervalo (reloj) cada 1 segundo
+                const timer = setInterval(() => {
+                    seconds--;
+                    
+                    // Actualizamos el texto en pantalla
+                    errorDiv.innerText = `Demasiados intentos fallidos. Por seguridad, espere ${seconds} segundos.`;
+                    if(submitBtn) submitBtn.innerHTML = `Bloqueado (${seconds}s)`;
+
+                    // 5. Cuando el tiempo llega a 0
+                    if (seconds <= 0) {
+                        clearInterval(timer);
+                        
+                        // Mensaje de éxito
+                        errorDiv.innerText = "El tiempo de espera ha terminado. Puede intentar nuevamente.";
+                        errorDiv.style.backgroundColor = "#d4edda"; // Verde claro
+                        errorDiv.style.color = "#155724";           // Verde oscuro
+                        errorDiv.style.borderColor = "#c3e6cb";
+                        
+                        // Reactivar el botón
+                        if(submitBtn) {
+                            submitBtn.disabled = false;
+                            submitBtn.innerHTML = "Conectar";
+                            submitBtn.style.backgroundColor = "#764ba2"; // Tu color original (morado)
+                            submitBtn.style.cursor = "pointer";
+                        }
+                    }
+                }, 1000); // 1000ms = 1 segundo
+            }
+        }
+    });
+</script>
 </html>

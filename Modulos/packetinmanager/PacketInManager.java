@@ -49,6 +49,8 @@ import org.projectfloodlight.openflow.types.TransportPort;
 import org.projectfloodlight.openflow.types.IPv4Address;
 import org.projectfloodlight.openflow.types.MacAddress;
 import org.projectfloodlight.openflow.types.U64;
+import net.floodlightcontroller.packet.TCP;
+
 
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
@@ -432,6 +434,23 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                 );
             }
 
+            // =================================================================
+            // CORRECCIÓN: Extraer puerto destino (TCP o UDP) para usarlo abajo
+            // =================================================================
+            int dstPort = 0; // Valor por defecto
+            if (ipv4.getProtocol() == IpProtocol.TCP) {
+                if (ipv4.getPayload() instanceof TCP) {
+                    TCP tcp = (TCP) ipv4.getPayload();
+                    dstPort = tcp.getDestinationPort().getPort();
+                }
+            } else if (ipv4.getProtocol() == IpProtocol.UDP) {
+                if (ipv4.getPayload() instanceof UDP) {
+                    UDP udp = (UDP) ipv4.getPayload();
+                    dstPort = udp.getDestinationPort().getPort();
+                }
+            }
+            // =================================================================
+
             // ==============================================
             // 2.1) Chequeo de SPOOFING usando nueva función (1/2/3)
             //     PERO: si el destino es el portal, NO se analiza spoofing
@@ -450,9 +469,101 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                         System.out.println("====================================\n");
                         return Command.STOP;
 
-                    case 2: // OK → sesión válida, permitir instalación/reinstalación de flows
-                        System.out.println("[Security] El usuario está solicitando flows");
-                        break;
+                    case 2: // OK → sesión válida
+    
+                        // 1. Obtener ID de usuario para consultar la BD
+                        Integer userId = SessionHelper.obtenerUserId(ipStr);
+                        if (userId == null) return Command.STOP; 
+
+                        // 2. CONSULTAR PERMISO Y CRITICIDAD DIRECTAMENTE
+                        // checkAccess ahora nos dice si es ALLOWED, DENIED:1 (Crítico) o DENIED:0 (Normal)
+                        String resultado = PoliciesHelper.checkAccess(userId, dstIp.toString(), dstPort);
+
+                        // =============================================================
+                        // CASO A: ACCESO PERMITIDO (ALLOWED)
+                        // =============================================================
+                        if (resultado.equals("ALLOWED")) {
+                            
+                            System.out.println("[Policies] ✔ Acceso permitido. Calculando ruta Multi-Switch...");
+
+                            OFPort outPortFirstHop = OFPort.FLOOD; 
+                            DatapathId dstSw = null;
+                            OFPort dstPortPhy = null;
+
+                            // Buscamos el dispositivo destino en la topología
+                            Iterator<? extends IDevice> devices = deviceManagerService.queryDevices(
+                                    MacAddress.NONE, VlanVid.ZERO, dstIp, IPv6Address.NONE, DatapathId.NONE, OFPort.ZERO);
+
+                            if (devices.hasNext()) {
+                                IDevice dstDevice = devices.next();
+                                SwitchPort[] aps = dstDevice.getAttachmentPoints();
+                                if (aps.length > 0) {
+                                    dstSw = aps[0].getSwitchDPID();
+                                    dstPortPhy = aps[0].getPort();
+                                }
+                            }
+
+                            if (dstSw == null) {
+                                doPacketOutFlood(sw, pi, inPort);
+                                return Command.STOP; 
+                            }
+
+                            Route routeOut = routingService.getRoute(sw.getId(), inPort, dstSw, dstPortPhy, U64.ZERO);
+                            Route routeIn  = routingService.getRoute(dstSw, dstPortPhy, sw.getId(), inPort, U64.ZERO);
+
+                            if (routeOut != null && routeIn != null) {
+                                if (routeOut.getPath().size() > 1) {
+                                    outPortFirstHop = routeOut.getPath().get(1).getPortId();
+                                } else if (sw.getId().equals(dstSw)) {
+                                    outPortFirstHop = dstPortPhy; 
+                                }
+                                // Instalamos flujos reactivos bidireccionales en Tabla 2
+                                installReactivePath(routeOut, srcIp, dstIp, ipv4.getProtocol(), dstPort, false, srcIp);
+                                installReactivePath(routeIn, dstIp, srcIp, ipv4.getProtocol(), dstPort, true, srcIp);
+                                System.out.println("[Policies] Rutas instaladas.");
+                            } 
+
+                            // Packet Out para liberar el paquete actual
+                            OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
+                            pob.setBufferId(pi.getBufferId());
+                            pob.setInPort(inPort);
+                            List<OFAction> poActions = new ArrayList<>();
+                            poActions.add(sw.getOFFactory().actions().output(outPortFirstHop, Integer.MAX_VALUE));
+                            pob.setActions(poActions);
+                            if (pi.getBufferId() == OFBufferId.NO_BUFFER) pob.setData(pi.getData());
+                            sw.write(pob.build());
+
+                            return Command.STOP;
+
+                        } 
+                        // =============================================================
+                        // CASO B: DENEGADO A RECURSO CRÍTICO (DENIED:1) -> LOG + DROP
+                        // =============================================================
+                        else if (resultado.equals("DENIED:1")) {
+                            
+                            System.out.println("[Policies] 🚨 ALERTA: Acceso NO autorizado a Recurso CRÍTICO.");
+
+                            // 1. REGISTRAR LOG (Solo ocurre aquí)
+                            PoliciesHelper.insertarLog(
+                                String.valueOf(userId), "User", ipStr, dstIp.toString(), dstPort, 
+                                "BLOCKED", "Intento de acceso a recurso CRÍTICO sin permisos"
+                            );
+
+                            // 2. CASTIGO TEMPORAL (Drop en Tabla 0)
+                            installTemporaryDropRule(sw, inPort, srcIp, dstIp, ipv4.getProtocol(), dstPort);
+
+                            return Command.STOP;
+
+                        } 
+                        // =============================================================
+                        // CASO C: DENEGADO A RECURSO NORMAL O DESCONOCIDO -> SOLO DROP
+                        // =============================================================
+                        else {
+                            // Puede ser "DENIED:0", "NOT_FOUND" o "DB_ERROR"
+                            System.out.println("[Policies] Acceso denegado (" + resultado + "). Bloqueo silencioso.");
+                            // No hacemos nada, el paquete muere aquí.
+                            return Command.STOP;
+                        }
 
                     case 3: // ERROR USUARIO → no registrado → enviarlo a portal
                         System.out.println("[Security] Usuario NO registrado (Caso 3).");
@@ -740,6 +851,24 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
 
         sw.write(pob.build());
     }
+    // =========================================================
+    //   NUEVO HELPER: Flooding genérico para tráfico desconocido
+    // =========================================================
+    private void doPacketOutFlood(IOFSwitch sw, OFPacketIn pi, OFPort inPort) {
+        OFPacketOut.Builder pob = sw.getOFFactory().buildPacketOut();
+        pob.setBufferId(pi.getBufferId());
+        pob.setInPort(inPort);
+        
+        List<OFAction> actions = new ArrayList<>();
+        actions.add(sw.getOFFactory().actions().output(OFPort.FLOOD, 0xFFFF));
+        pob.setActions(actions);
+        
+        if (pi.getBufferId() == OFBufferId.NO_BUFFER) {
+            pob.setData(pi.getData());
+        }
+        
+        sw.write(pob.build());
+    }
 
     // ===== Métodos de IFloodlightModule =====
 
@@ -952,6 +1081,86 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
         }
     }
 
+    /**
+     * Instala flujos reactivos en TODOS los switches de la ruta dada.
+     * TableId=0, Priority=600, IdleTimeout=60s.
+     * * @param isReverseDirection: Si es true, asumimos que el 'portL4' es el puerto ORIGEN (ej. respuesta del servidor 80).
+     */
+    private void installReactivePath(Route route, IPv4Address srcIp, IPv4Address dstIp, 
+                                     IpProtocol proto, int portL4, boolean isReverseDirection, IPv4Address ownerIp) {
+        
+        List<NodePortTuple> path = route.getPath();
+        if (path == null || path.isEmpty()) return;
+
+        System.out.println("   [REACTIVE] Instalando ruta (" + (path.size()/2) + " hops): " + srcIp + " -> " + dstIp);
+
+        // 1. GENERAR COOKIE COMPUESTO: [ APP_ID (32 bits) | IP_USUARIO (32 bits) ]
+    
+        // Obtenemos el valor numérico de la IP (asegurando que sea positivo con & 0xFFFFFFFFL)
+        long ipValue = ownerIp.getInt() & 0xFFFFFFFFL;
+        
+        // Combinamos: Desplazamos el AppID 32 bits a la izquierda y sumamos la IP
+        long rawCookie = (ACL_APP_ID << 32) | ipValue;
+        
+        U64 flowCookie = U64.of(rawCookie);
+    
+        System.out.println("   [DEBUG] Cookie Generado: " + Long.toHexString(rawCookie));
+
+        // Iteramos la ruta par a par (Switch:In -> Switch:Out)
+        for (int i = 0; i < path.size() - 1; i += 2) {
+            DatapathId dpid = path.get(i).getNodeId();
+            OFPort outPort = path.get(i+1).getPortId(); // Puerto de salida hacia el siguiente salto
+            
+            IOFSwitch sw = switchService.getSwitch(dpid);
+            if (sw == null) continue;
+
+            // Construir el Match
+            Match.Builder mb = sw.getOFFactory().buildMatch();
+            mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+              .setExact(MatchField.IPV4_SRC, srcIp)
+              .setExact(MatchField.IPV4_DST, dstIp)
+              .setExact(MatchField.IP_PROTO, proto);
+
+            // Filtros de Puerto L4 (TCP/UDP)
+            if (proto == IpProtocol.TCP) {
+                if (isReverseDirection) {
+                    // Es tráfico de vuelta (Server -> Client), el puerto conocido (ej. 80) es el SOURCE
+                    mb.setExact(MatchField.TCP_SRC, TransportPort.of(portL4));
+                } else {
+                    // Es tráfico de ida (Client -> Server), el puerto conocido (ej. 80) es el DST
+                    mb.setExact(MatchField.TCP_DST, TransportPort.of(portL4));
+                }
+            } else if (proto == IpProtocol.UDP) {
+                if (isReverseDirection) {
+                    mb.setExact(MatchField.UDP_SRC, TransportPort.of(portL4));
+                } else {
+                    mb.setExact(MatchField.UDP_DST, TransportPort.of(portL4));
+                }
+            }
+
+            // Acción: Output
+            ArrayList<OFAction> actions = new ArrayList<>();
+            actions.add(sw.getOFFactory().actions().output(outPort, Integer.MAX_VALUE));
+            
+            ArrayList<OFInstruction> instructions = new ArrayList<>();
+            instructions.add(sw.getOFFactory().instructions().applyActions(actions));
+
+            // Construir Flow Mod
+            OFFlowAdd flow = sw.getOFFactory().buildFlowAdd()
+                .setBufferId(OFBufferId.NO_BUFFER)
+                .setTableId(TableId.of(2    ))     // Tabla de Forwarding
+                .setPriority(600)              // Prioridad Reactiva
+                .setIdleTimeout(300)            // Timeout corto
+                .setCookie(flowCookie) // <--- AQUÍ ASIGNAMOS EL NOMBRE NUMÉRICO
+                .setHardTimeout(0)
+                .setMatch(mb.build())
+                .setInstructions(instructions)
+                .build();
+
+            sw.write(flow);
+        }
+    }
+
     private void installSpoofingDropFlow(IOFSwitch sw, OFPort inPort, String reason) {
         if (sw == null || inPort == null) {
             System.out.println("[Security] No se puede instalar DROP: switch o puerto nulos.");
@@ -1001,13 +1210,16 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
             IOFSwitch sw = switchService.getSwitch(dpid);
             if (sw == null) continue;
 
+            // --- A) Borrar de Tabla 2 (ACLs Proactivas) ---
             OFFlowDelete flowDelete = sw.getOFFactory().buildFlowDelete()
                     .setTableId(TableId.of(2)) // Borrar de la Tabla 2 (donde pusimos las ACLs)
                     .setCookie(flowCookie)
                     .setCookieMask(cookieMask) // IMPORTANTE: Sin esto, borra todo
                     .build();
-            
             sw.write(flowDelete);
+
+
+
             System.out.println("   [REVOKE] Enviado FlowDelete a SW " + dpid + " para cookie " + flowCookie);
         }
 
@@ -1207,5 +1419,44 @@ public class PacketInManager implements IOFMessageListener, IFloodlightModule, I
                 .build();
 
         sw.write(dropFlow);
+    }
+
+    /**
+     * Instala un DROP temporal en Tabla 0. 
+     * Se usa cuando alguien toca un recurso CRÍTICO sin permiso.
+     */
+    private void installTemporaryDropRule(IOFSwitch sw, OFPort inPort, 
+                                          IPv4Address srcIp, IPv4Address dstIp, 
+                                          IpProtocol proto, int dstPort) {
+        
+        int BAN_DURATION = 60; // 60 segundos de castigo
+
+        Match.Builder mb = sw.getOFFactory().buildMatch();
+        mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+          .setExact(MatchField.IPV4_SRC, srcIp)
+          .setExact(MatchField.IPV4_DST, dstIp)
+          .setExact(MatchField.IP_PROTO, proto);
+
+        if (proto == IpProtocol.TCP) {
+            mb.setExact(MatchField.TCP_DST, TransportPort.of(dstPort));
+        } else if (proto == IpProtocol.UDP) {
+            mb.setExact(MatchField.UDP_DST, TransportPort.of(dstPort));
+        }
+
+        // Sin acciones = DROP
+        List<OFInstruction> instructions = new ArrayList<>(); 
+
+        OFFlowAdd dropFlow = sw.getOFFactory().buildFlowAdd()
+            .setBufferId(OFBufferId.NO_BUFFER)
+            .setTableId(TableId.of(0))      // Tabla 0 para bloqueo inmediato
+            .setPriority(1000)              // Prioridad ALTA (gana a las demás)
+            .setHardTimeout(BAN_DURATION)   
+            .setIdleTimeout(0)
+            .setMatch(mb.build())
+            .setInstructions(instructions)
+            .build();
+
+        sw.write(dropFlow);
+        System.out.println("[Security] ⛔ BAN TEMPORAL a recurso CRÍTICO: " + srcIp + " -> " + dstIp + ":" + dstPort);
     }
 }

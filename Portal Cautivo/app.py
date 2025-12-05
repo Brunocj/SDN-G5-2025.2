@@ -7,6 +7,7 @@ import mysql.connector
 import hashlib
 import os
 import re
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = 'super_secreto_universidad' 
@@ -40,6 +41,23 @@ IP_FLOODLIGHT = "192.168.201.200"
 PORT_FLOODLIGHT = "8080"
 SWITCH_ID = "00:00:00:00:00:00:00:01"
 
+# RUTAS DE LA API DEL CONTROLADOR (Ajusta según tu configuración en Java)
+# Endpoint para consultar PossibleSessionResource.java
+URL_POSSIBLE_SESSION = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/security/obtenerPosibleSesion" 
+# Endpoint para CreateActiveSessionResource.java
+URL_ACTIVE_SESSION   = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/security/crearSesionActiva"  
+# Endpoint para Borrar sesión activa gaaa
+URL_DELETE_SESSION = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/security/borrarSesionActiva"
+
+# --- SEGURIDAD R1 + ANTI-DDoS ---
+MAX_WEB_ATTEMPTS = 3       # Al 3er fallo: Mensaje "Espere..."
+MAX_SDN_ATTEMPTS = 10      # Al 10mo fallo: DROP Físico en Switch
+LOCKOUT_TIME = 300         # Tiempo de bloqueo web (5 min)
+
+# URL del nuevo recurso Java (Ajusta la IP si cambió)
+URL_BLOCK_IP = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/security/bloquearIP"
+
+
 # MAPEO VISUAL DE ROLES
 ROLES_VISUALES = {
     "ROLE_ADMIN": "DTI",
@@ -67,6 +85,113 @@ def api_roles(username):
     roles = obtener_roles_sdn(username)
     return jsonify({"status": "success", "username": username, "roles": roles,
                     "default_role": determining_rol_principal(roles)})
+
+# ============================================================
+# FUNCIONES DE SEGURIDAD
+# ============================================================
+def bloquear_ip_en_sdn(user_ip):
+    """Envía la orden de DROP al controlador."""
+    try:
+        payload = {"ip": user_ip}
+        print(f"[SECURITY] 🚨 UMBRAL CRÍTICO ({user_ip}). Enviando orden de DROP al SDN...")
+        requests.post(URL_BLOCK_IP, json=payload, timeout=2)
+    except Exception as e:
+        print(f"[SECURITY] Error contactando al SDN: {e}")
+
+def verificar_estado_seguridad(ip):
+    """
+    Revisa si la IP está castigada (Web o SDN) y si el tiempo de castigo ya expiró.
+    """
+    try:
+        conn = mysql.connector.connect(**DB_SDN)
+        cur = conn.cursor()
+        cur.execute("SELECT attempts, last_attempt FROM login_attempts WHERE ip_address = %s", (ip,))
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            intentos, ultima_vez = row
+            ahora = datetime.now()
+            delta = ahora - ultima_vez
+            segundos_pasados = delta.total_seconds()
+
+            # ---------------------------------------------------------
+            # NIVEL 2: Bloqueo SDN (10 o más intentos)
+            # ---------------------------------------------------------
+            if intentos >= MAX_SDN_ATTEMPTS:
+                # El castigo SDN dura 10 minutos (600 segundos).
+                # Debemos coincidir con el hardTimeout del Java.
+                TIEMPO_CASTIGO_SDN = 600 
+                
+                if segundos_pasados < TIEMPO_CASTIGO_SDN:
+                    # Aún está en tiempo de castigo
+                    return True, "ACCESO DENEGADO POR SEGURIDAD (DDoS DETECTADO). SU IP HA SIDO BLOQUEADA TEMPORALMENTE."
+                else:
+                    # ¡Ya cumplió su condena!
+                    # El flujo en el switch ya expiró, así que borramos el registro en Python.
+                    resetear_intentos(ip)
+                    return False, None
+
+            # ---------------------------------------------------------
+            # NIVEL 1: Bloqueo Web (3 a 9 intentos)
+            # ---------------------------------------------------------
+            if intentos >= MAX_WEB_ATTEMPTS:
+                if segundos_pasados < LOCKOUT_TIME:
+                    restante = int(LOCKOUT_TIME - segundos_pasados)
+                    return True, f"Demasiados intentos fallidos. Por seguridad, espere {restante} segundos."
+                else:
+                    # Expiró el tiempo web, perdonamos.
+                    resetear_intentos(ip)
+                    return False, None
+                    
+        return False, None
+
+    except Exception as e:
+        print(f"Error DB Seguridad: {e}")
+        return False, None
+
+def registrar_fallo_y_castigar(ip):
+    """Incrementa fallos y decide si activar el DROP."""
+    try:
+        conn = mysql.connector.connect(**DB_SDN)
+        cur = conn.cursor()
+        
+        # Insertar o sumar 1 al contador
+        sql = """
+            INSERT INTO login_attempts (ip_address, attempts, last_attempt)
+            VALUES (%s, 1, NOW())
+            ON DUPLICATE KEY UPDATE 
+            attempts = attempts + 1, 
+            last_attempt = NOW()
+        """
+        cur.execute(sql, (ip,))
+        conn.commit()
+
+        # Verificar el nuevo total
+        cur.execute("SELECT attempts FROM login_attempts WHERE ip_address = %s", (ip,))
+        (nuevos_intentos,) = cur.fetchone()
+        conn.close()
+
+        print(f"[SECURITY] IP {ip} -> Fallos acumulados: {nuevos_intentos}")
+
+        # DETONADOR: Si llega EXACTAMENTE al umbral SDN, disparamos el DROP
+        if nuevos_intentos >= MAX_SDN_ATTEMPTS:
+            bloquear_ip_en_sdn(ip)
+
+    except Exception as e:
+        print(f"Error registrando fallo: {e}")
+
+def resetear_intentos(ip):
+    """Borra el historial tras un login exitoso."""
+    try:
+        conn = mysql.connector.connect(**DB_SDN)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM login_attempts WHERE ip_address = %s", (ip,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        pass
+
 
 # ============================================================
 # PORTAL PRINCIPAL
@@ -97,7 +222,23 @@ def index():
             password = request.form['password']
             user_ip = request.remote_addr
 
+            # [PASO 1] VERIFICACIÓN PREVIA (¿Está castigado?)
+            esta_bloqueado, msg_bloqueo = verificar_estado_seguridad(user_ip)
+            if esta_bloqueado:
+
+                # 🔴 CAMBIO CRÍTICO AQUÍ:
+                # Aunque ya esté bloqueado, si sigue intentando (es un script/hacker),
+                # debemos registrar este nuevo intento para que el contador suba a 4, 5... 10.
+                registrar_fallo_y_castigar(user_ip)  # <--- AGREGAR ESTA LÍNEA
+
+                return render_template('login.html', error=msg_bloqueo)
+
+            # [PASO 2] AUTENTICACIÓN RADIUS
             if autenticar_con_radius(username, password):
+
+                # ¡Éxito! -> Limpiamos sus pecados
+                resetear_intentos(user_ip)
+
                 roles = obtener_roles_sdn(username)
                 if len(roles) > 1:
                     session['temp_user'] = username
@@ -107,6 +248,10 @@ def index():
                 else:
                     return finalizar_login(username, user_ip, roles[0])
             else:
+
+                # [PASO 3] FALLO -> Registrar y posible Castigo
+                registrar_fallo_y_castigar(user_ip)
+
                 error = "Credenciales incorrectas."
 
     # 2) Si ya está autenticado (GET o POST que no era crear_usuario)
@@ -143,40 +288,166 @@ def seleccionar_rol():
 # ============================================================
 # LOGOUT
 # ============================================================
+def eliminar_sesion_activa_bd(user_ip):
+    """
+    POST /wm/security/borrarSesionActiva
+    Payload: { "ip": "..." }
+    """
+    payload = {"ip": user_ip}
+    try:
+        resp = requests.post(URL_DELETE_SESSION, json=payload, timeout=2)
+        if resp.status_code == 200 and resp.json().get('success'):
+            print(f"[SDN] Sesión eliminada de BD para {user_ip}")
+        else:
+            print(f"[SDN] Error borrando sesión de BD: {resp.text}")
+    except Exception as e:
+        print(f"[SDN] Excepción borrando sesión BD: {e}")
+
+@app.route('/logout', methods=['POST'])
 @app.route('/logout', methods=['POST'])
 def logout():
     u = session.get('user_logged_in')
     ip = session.get('user_ip')
 
     if u and ip:
-        revocar_en_floodlight(ip)
+        # 1. Limpiar Switch (RAM/Flows)
+        # Esto llama a PacketInManager.revokeAccess()
+        revocar_en_floodlight(ip) 
+        
+        # 2. Limpiar Base de Datos (Persistencia) <- NUEVO
+        eliminar_sesion_activa_bd(ip)
+
+        # 3. Radius Stop
         enviar_accounting_stop(u, ip)
 
     session.clear()
     return redirect(url_for('index'))
 
 # ============================================================
+# LÓGICA CONSULTAR Y REGISTRAR SESIONES                             #DORITOS2407
+# ============================================================
+
+def consultar_posible_sesion(user_ip):
+    """
+    Consulta al controlador si existe una 'posible sesión' para esta IP.
+    Retorna un diccionario con {mac, switchid, inport} si existe, o None si falla.
+    """
+    try:
+        # Enviamos la IP como query param, tal como lo espera PossibleSessionResource.java
+        payload = {'ip': user_ip}
+        resp = requests.get(URL_POSSIBLE_SESSION, params=payload, timeout=3)
+        
+        data = resp.json()
+        
+        # Verificamos 'success' según tu Java
+        if resp.status_code == 200 and data.get('success') is True:
+            return {
+                "mac": data.get("mac"),
+                "switchid": data.get("switchid"),
+                "inport": data.get("inport")
+            }
+        else:
+            print(f"[SDN] No se halló posible sesión para IP {user_ip}. Error: {data.get('error')}")
+            return None
+
+    except requests.exceptions.RequestException as e:
+        print(f"[SDN] Error conectando con PossibleSessionResource: {e}")
+        return None
+
+
+def registrar_sesion_activa(user_ip, mac, switchid, inport, username):
+    """
+    Envía un POST al controlador para mover la sesión a 'sesiones_activas'.
+    """
+    payload = {
+        "ip": user_ip,
+        "mac": mac,
+        "switchid": switchid,
+        "inport": inport,
+        "userId": username  # Enviamos el username como ID de usuario
+    }
+    
+    try:
+        resp = requests.post(URL_ACTIVE_SESSION, json=payload, timeout=3)
+        data = resp.json()
+        
+        if resp.status_code == 200 and data.get('success') is True:
+            print(f"[SDN] Sesión activa registrada exitosamente para {username} en {user_ip}")
+            return True
+        else:
+            print(f"[SDN] Error registrando sesión activa: {data.get('error')}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        print(f"[SDN] Error conectando con CreateActiveSessionResource: {e}")
+        return False
+
+# ============================================================
 # LÓGICA DE LOGIN COMPLETO
 # ============================================================
 def finalizar_login(username, ip, rol):
-    # 1. Registro de inicio de sesión en RADIUS (Accounting)
+    print(f"--- Iniciando proceso de login para {username} ({ip}) ---")
+
+    # -----------------------------------------------------------
+    # PASO 1: Validar contra el Controlador (Possible Sessions)
+    # -----------------------------------------------------------
+    datos_fisicos = consultar_posible_sesion(ip)
+    
+    if not datos_fisicos:
+        # Si el controlador no reconoce la IP en sus tablas de switch,
+        # rechazamos el login por seguridad (evita spoofing o logins fuera de red)
+        revocar_en_floodlight(ip) 
+        enviar_accounting_stop(username, ip)
+        return render_template('login.html', error="Error de seguridad: No se detectó su conexión física en la red SDN.")
+
+    # Extraemos los datos que nos devolvió Java
+    mac_usuario = datos_fisicos['mac']
+    switch_id   = datos_fisicos['switchid']
+    in_port     = datos_fisicos['inport']
+    print(f"[SDN] Datos físicos validados: MAC={mac_usuario}, SW={switch_id}, Port={in_port}")
+
+    # -----------------------------------------------------------
+    # PASO 2: Contabilidad Radius (Start)
+    # -----------------------------------------------------------
     enviar_accounting_start(username, ip)
 
-    # 2. Obtener las políticas específicas desde la BD (Tu nueva función)
-    # Nota: 'rol' es el que el usuario seleccionó o el que tenía por defecto
+    # -----------------------------------------------------------
+    # PASO 3: Obtener y Aplicar Políticas (ACLs)
+    # -----------------------------------------------------------
     recursos_autorizados = obtener_recursos_autorizados_por_rol(username, rol)
     
-    # 3. Enviar todo a Floodlight
-    # Intentamos aplicar las políticas ACL complejas
-    print(f"[SDN] Aplicando políticas para {username} ({ip}) con rol {rol}: {recursos_autorizados}")
+    print(f"[SDN] Aplicando políticas para {username} ({ip}) con rol {rol}...")
     exito_acl = enviar_politicas_a_floodlight(ip, recursos_autorizados)
     
-    # Opcional: Mantener tu antigua llamada 'autorizar_en_floodlight' si hacía otra cosa 
-    # (como el etiquetado básico en Tabla 0), o integrarla aquí.
-    # Por ahora asumiremos que el nuevo endpoint hace todo el trabajo.
-    
     if exito_acl:
-        # 4. Crear sesión local en Flask
+        # -----------------------------------------------------------
+        # PASO 4: Registrar Sesión Activa en Controlador (NUEVO)
+        # -----------------------------------------------------------
+
+        # A. Obtenemos el ID real de la BD
+        user_id_numerico = obtener_id_usuario(username)  # <<<< CAMBIO 1
+
+        # Si por alguna razón falla (no debería), usamos el username como respaldo
+        if not user_id_numerico:
+            user_id_numerico = username
+        # Solo si las políticas se aplicaron bien, le decimos al controlador 
+        # que guarde la sesión en 'sesiones_activas'
+        reg_exito = registrar_sesion_activa(
+            user_ip=ip, 
+            mac=mac_usuario, 
+            switchid=switch_id, 
+            inport=in_port, 
+            username=user_id_numerico
+        )
+
+        if not reg_exito:
+            # Opcional: ¿Qué hacer si falla el registro en DB pero funcionaron las ACLs?
+            # Por ahora solo lo logueamos, pero podrías decidir abortar.
+            print("[WARN] Las ACLs funcionaron pero falló el registro en sesiones_activas.")
+
+        # -----------------------------------------------------------
+        # PASO 5: Crear sesión local Flask
+        # -----------------------------------------------------------
         session['user_logged_in'] = username
         session['role_active'] = rol
         session['user_ip'] = ip
@@ -188,9 +459,8 @@ def finalizar_login(username, ip, rol):
         
         return redirect(url_for('index'))
     else:
-        # Si falla el controlador, decides si bloqueas al usuario o lo dejas pasar con permisos mínimos
-        # Para seguridad estricta: retornamos error.
-        revocar_en_floodlight(ip) # Por si acaso
+        # Fallo al aplicar políticas
+        revocar_en_floodlight(ip)
         enviar_accounting_stop(username, ip)
         return render_template('login.html', error="Error aplicando políticas de red. Contacte a DTI.")
 
@@ -542,6 +812,28 @@ def obtener_roles_sdn(username):
 
     return roles if roles else ["ROLE_GUEST"]
 
+def obtener_id_usuario(username):
+    """
+    Busca el ID numérico del usuario en la base de datos sdn_policy.
+    """
+    try:
+        # Usamos la configuración DB_SDN que ya tienes definida
+        conn = mysql.connector.connect(**DB_SDN)
+        cur = conn.cursor()
+        
+        # Consultamos el ID
+        cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
+        
+        conn.close()
+        
+        if row:
+            return str(row[0]) # Lo devolvemos como String para enviarlo en el JSON
+            
+    except Exception as e:
+        print(f"[ERROR] Falló al obtener ID para {username}: {e}")
+    
+    return None
 
 def crear_usuario_bd(req):
     username = req.form['new_username'].strip()
@@ -642,6 +934,7 @@ def obtener_recursos_autorizados_por_rol(username, radius_role):
             JOIN resources_roles rr ON res.id = rr.resource_id
             JOIN roles r ON rr.role_id = r.id
             WHERE r.role_name = %s
+            AND res.isProactive = 1
         """
         
         # Ejecutamos pasando los parámetros en orden: (rol, usuario, usuario)
@@ -690,7 +983,18 @@ def enviar_politicas_a_floodlight(user_ip, lista_recursos):
     except requests.exceptions.RequestException as e:
         print(f"[SDN] Fallo de conexión con Floodlight: {e}")
         return False
+        
+def revocar_en_floodlight(ip):
+    # Nuevo Endpoint en tu módulo PacketInManager
+    url = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/resources/revoke"
+    
+    payload = {"user_ip": ip}
 
+    try:
+        resp = requests.post(url, json=payload, timeout=2)
+        print(f"[SDN] Revocación enviada para {ip}: {resp.status_code}")
+    except Exception as e:
+        print(f"[SDN] Error revocando acceso: {e}")
 
 
 # ============================================================
@@ -727,57 +1031,6 @@ def enviar_accounting_stop(u, ip):
         srv.SendPacket(req)
     except:
         pass
-
-
-# ============================================================
-#   INTEGRACIÓN CON FLOODLIGHT
-# ============================================================
-def obtener_mac_de_ip(ip):
-    try:
-        s = os.popen(f'arp -n {ip}')
-        m = re.search(r"(([a-f\d]{1,2}\:){5}[a-f\d]{1,2})", s.read())
-        if m: return m.group(0)
-    except:
-        pass
-    return None
-
-
-def autorizar_en_floodlight(ip, role):
-    mac = obtener_mac_de_ip(ip)
-    url = f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/staticflowpusher/json"
-
-    prio = "32500" if role in ["ROLE_PROFESSOR", "ROLE_RESEARCHER", "ROLE_ADMIN"] else "32000"
-
-    data = {
-        "switch": SWITCH_ID,
-        "name": f"auth_{ip}",
-        "priority": prio,
-        "eth_type": "0x0800",
-        "ipv4_src": ip,
-        "active": "true",
-        "actions": "output=normal"
-    }
-
-    if mac:
-        data["eth_src"] = mac
-
-    try:
-        requests.post(url, json=data, timeout=2)
-        return True
-    except:
-        return True
-
-
-def revocar_en_floodlight(ip):
-    try:
-        requests.delete(
-            f"http://{IP_FLOODLIGHT}:{PORT_FLOODLIGHT}/wm/staticflowpusher/json",
-            json={"name": f"auth_{ip}"}, timeout=2
-        )
-    except:
-        pass
-
-
 # ============================================================
 # MAIN
 # ============================================================

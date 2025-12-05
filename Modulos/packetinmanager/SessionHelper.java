@@ -52,4 +52,49 @@ public class SessionHelper {
             e.printStackTrace();
         }
     }
+
+    /**
+     * Obtiene el userID asociado a la IP desde la tabla sesiones_activas.
+     *
+     * @param ip IP del host (ej. "10.0.0.5")
+     * @return el userID asociado (Integer), o null si no existe o no es numérico
+     */
+    public static Integer obtenerUserId(String ip) {
+
+        String sql = "SELECT userID FROM sesiones_activas " +
+                    "WHERE ip = ? " +
+                    "ORDER BY idsesiones_activas DESC " +
+                    "LIMIT 1";
+
+        try (Connection conn = getConnection();
+            PreparedStatement ps = conn.prepareStatement(sql)) {
+
+            ps.setString(1, ip);
+
+            try (ResultSet rs = ps.executeQuery()) {
+
+                if (rs.next()) {
+                    String userIdStr = rs.getString("userID");
+                    try {
+                        Integer userId = Integer.parseInt(userIdStr);
+                        System.out.println("[SesionesDB] obtenerUserId(" + ip + ") -> " + userId);
+                        return userId;
+                    } catch (NumberFormatException ex) {
+                        System.err.println("[SesionesDB] userID no es numérico para IP " + ip +
+                                        " (valor='" + userIdStr + "')");
+                        return null;
+                    }
+                } else {
+                    System.out.println("[SesionesDB] obtenerUserId(" + ip + ") -> NO EXISTE en sesiones_activas");
+                    return null;
+                }
+            }
+
+        } catch (SQLException e) {
+            System.err.println("[SesionesDB] ERROR en obtenerUserId(" + ip + ")");
+            e.printStackTrace();
+            return null;
+        }
+    }
+
 }
