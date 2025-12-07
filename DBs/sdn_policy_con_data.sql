@@ -16,6 +16,37 @@
 /*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;
 
 --
+-- Table structure for table `access_logs`
+--
+
+DROP TABLE IF EXISTS `access_logs`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!40101 SET character_set_client = utf8 */;
+CREATE TABLE `access_logs` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `timestamp` datetime DEFAULT CURRENT_TIMESTAMP,
+  `username` varchar(50) DEFAULT NULL,
+  `role` varchar(50) DEFAULT NULL,
+  `src_ip` varchar(20) DEFAULT NULL,
+  `dst_ip` varchar(20) DEFAULT NULL,
+  `dst_port` int(11) DEFAULT NULL,
+  `action` varchar(20) DEFAULT NULL,
+  `details` text,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `access_logs`
+--
+
+LOCK TABLES `access_logs` WRITE;
+/*!40000 ALTER TABLE `access_logs` DISABLE KEYS */;
+INSERT INTO `access_logs` VALUES (1,'2025-12-05 09:38:57','4','User','10.0.0.55','20.0.0.5',8082,'BLOCKED','Intento de acceso a recurso CRÍTICO sin permisos'),(2,'2025-12-05 09:40:03','4','User','10.0.0.55','20.0.0.5',8082,'BLOCKED','Intento de acceso a recurso CRÍTICO sin permisos'),(3,'2025-12-05 09:40:03','4','User','10.0.0.55','20.0.0.5',8082,'BLOCKED','Intento de acceso a recurso CRÍTICO sin permisos');
+/*!40000 ALTER TABLE `access_logs` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
 -- Table structure for table `careers`
 --
 
@@ -99,6 +130,30 @@ INSERT INTO `courses` VALUES (1,'SDN','TEL354',1),(2,'Ingeniería Inalambrica','
 UNLOCK TABLES;
 
 --
+-- Table structure for table `login_attempts`
+--
+
+DROP TABLE IF EXISTS `login_attempts`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!40101 SET character_set_client = utf8 */;
+CREATE TABLE `login_attempts` (
+  `ip_address` varchar(45) NOT NULL,
+  `attempts` int(11) DEFAULT '0',
+  `last_attempt` datetime DEFAULT NULL,
+  PRIMARY KEY (`ip_address`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `login_attempts`
+--
+
+LOCK TABLES `login_attempts` WRITE;
+/*!40000 ALTER TABLE `login_attempts` DISABLE KEYS */;
+/*!40000 ALTER TABLE `login_attempts` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
 -- Table structure for table `resources`
 --
 
@@ -112,8 +167,9 @@ CREATE TABLE `resources` (
   `server_port` int(11) NOT NULL DEFAULT '80',
   `protocol` enum('tcp','udp','any') DEFAULT 'tcp',
   `critical` tinyint(1) DEFAULT '0',
+  `isProactive` tinyint(4) DEFAULT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=16 DEFAULT CHARSET=utf8mb4;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -122,7 +178,7 @@ CREATE TABLE `resources` (
 
 LOCK TABLES `resources` WRITE;
 /*!40000 ALTER TABLE `resources` DISABLE KEYS */;
-INSERT INTO `resources` VALUES (1,'TEL354 Web','20.0.0.4',8080,'tcp',0),(2,'TEL280 Web','20.0.0.4',8081,'tcp',0),(3,'TEL223 Web','20.0.0.4',8082,'tcp',0),(4,'TEL141 Web','20.0.0.4',8083,'tcp',0),(5,'TEL142 Web','20.0.0.4',8084,'tcp',0),(6,'IND231 Web','20.0.0.4',8085,'tcp',0);
+INSERT INTO `resources` VALUES (1,'TEL354 Web','20.0.0.4',8080,'tcp',0,0),(2,'TEL280 Web','20.0.0.4',8081,'tcp',0,0),(3,'TEL223 Web','20.0.0.4',8082,'tcp',0,0),(4,'TEL141 Web','20.0.0.4',8083,'tcp',0,0),(5,'TEL142 Web','20.0.0.4',8084,'tcp',0,0),(6,'IND231 Web','20.0.0.4',8085,'tcp',0,0),(7,'Portal General','20.0.0.3',8080,'tcp',0,1),(8,'Portal Alumno','20.0.0.3',8081,'tcp',0,1),(9,'Portal Profesor','20.0.0.3',8082,'tcp',0,1),(10,'Portal Investigador','20.0.0.3',8083,'tcp',0,1),(11,'Portal Admin','20.0.0.3',8084,'tcp',0,1),(12,'Portal Csantivanez','20.0.0.5',8080,'tcp',0,0),(13,'Moodle Aula Virtual','20.0.0.5',8081,'tcp',1,0),(14,'Intranet Docente ERP','20.0.0.5',8082,'tcp',1,0),(15,'Servidor Datos Laboratorio','20.0.0.5',8083,'tcp',1,0);
 /*!40000 ALTER TABLE `resources` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -149,7 +205,7 @@ CREATE TABLE `resources_roles` (
 
 LOCK TABLES `resources_roles` WRITE;
 /*!40000 ALTER TABLE `resources_roles` DISABLE KEYS */;
-INSERT INTO `resources_roles` VALUES (1,1),(1,2),(1,4),(2,1),(2,2),(2,4),(3,1),(3,2),(3,4),(4,1),(4,2),(4,4),(5,1),(5,2),(5,4),(6,1),(6,2),(6,4);
+INSERT INTO `resources_roles` VALUES (7,1),(7,2),(7,3),(7,4),(8,4),(9,2),(10,3),(11,1),(13,4),(14,2),(15,3);
 /*!40000 ALTER TABLE `resources_roles` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -195,7 +251,7 @@ CREATE TABLE `user_courses` (
   KEY `course_id` (`course_id`),
   CONSTRAINT `user_courses_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT `user_courses_ibfk_2` FOREIGN KEY (`course_id`) REFERENCES `courses` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB AUTO_INCREMENT=11 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=12 DEFAULT CHARSET=utf8mb4;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -204,7 +260,7 @@ CREATE TABLE `user_courses` (
 
 LOCK TABLES `user_courses` WRITE;
 /*!40000 ALTER TABLE `user_courses` DISABLE KEYS */;
-INSERT INTO `user_courses` VALUES (1,2,1,'profesor'),(2,3,1,'alumno'),(3,5,1,'profesor'),(4,5,2,'profesor'),(5,4,1,'alumno'),(10,4,2,'alumno');
+INSERT INTO `user_courses` VALUES (1,2,1,'profesor'),(2,3,1,'alumno'),(3,5,1,'profesor'),(4,5,2,'profesor'),(5,4,1,'alumno'),(10,4,2,'alumno'),(11,4,3,'alumno');
 /*!40000 ALTER TABLE `user_courses` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -224,7 +280,7 @@ CREATE TABLE `user_resources` (
   KEY `resource_id` (`resource_id`),
   CONSTRAINT `user_resources_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT `user_resources_ibfk_2` FOREIGN KEY (`resource_id`) REFERENCES `resources` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -233,6 +289,7 @@ CREATE TABLE `user_resources` (
 
 LOCK TABLES `user_resources` WRITE;
 /*!40000 ALTER TABLE `user_resources` DISABLE KEYS */;
+INSERT INTO `user_resources` VALUES (1,5,12);
 /*!40000 ALTER TABLE `user_resources` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -252,7 +309,7 @@ CREATE TABLE `user_roles` (
   KEY `role_id` (`role_id`),
   CONSTRAINT `user_roles_ibfk_1` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE,
   CONSTRAINT `user_roles_ibfk_2` FOREIGN KEY (`role_id`) REFERENCES `roles` (`id`) ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -261,7 +318,7 @@ CREATE TABLE `user_roles` (
 
 LOCK TABLES `user_roles` WRITE;
 /*!40000 ALTER TABLE `user_roles` DISABLE KEYS */;
-INSERT INTO `user_roles` VALUES (1,1,1),(2,2,2),(3,3,4),(4,4,4),(5,5,2);
+INSERT INTO `user_roles` VALUES (1,1,1),(2,2,2),(3,3,4),(4,4,4),(5,5,2),(6,5,3);
 /*!40000 ALTER TABLE `user_roles` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -306,4 +363,4 @@ UNLOCK TABLES;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2025-12-01  6:14:57
+-- Dump completed on 2025-12-05 22:23:58
